@@ -12,7 +12,7 @@ use crate::bing::{
 use anyhow::{Result, anyhow};
 
 impl BingBot {
-    pub(crate) fn new_mobile() -> Self {
+    pub(crate) fn new_mobile_browser() -> Self {
         std::fs::create_dir_all("./tmp").unwrap();
         let temp_dir = tempfile::tempdir_in("./tmp").unwrap();
         let options = default_options_builder()
@@ -22,7 +22,7 @@ impl BingBot {
         let browser = Browser::new(options).unwrap();
         BingBot {
             browser: ManuallyDrop::new(browser),
-            _temp_dir: ManuallyDrop::new(temp_dir),
+            temp_dir: ManuallyDrop::new(temp_dir),
         }
     }
 }
@@ -30,17 +30,15 @@ impl BingBot {
 pub(crate) fn process_account(email: &str, password: &str, browser: &mut Browser) -> Result<()> {
     let tab = browser.new_tab()?;
     info!("开始处理移动端账号: {}", email);
-    login_bing_mobile(email, password, &tab).map_err(|e| {
-        let _ = shot_with_faild(&tab, "mobile_login", email);
-        e
+    login_bing_mobile(email, password, &tab).inspect_err(|_| {
+        shot_with_faild(&tab, "mobile_login", email);
     })?;
 
     sleep(Duration::from_secs(5));
 
     info!("账号 {} 登录成功，开始搜索任务", email);
-    search(&tab, browser, email).map_err(|e| {
-        let _ = shot_with_faild(&tab, "mobile_search", email);
-        e
+    search(&tab, browser, email).inspect_err(|_| {
+        shot_with_faild(&tab, "mobile_search", email);
     })?;
     Ok(())
 }
@@ -116,7 +114,7 @@ fn search(tab: &Tab, browser: &mut Browser, email: &str) -> Result<()> {
             3,
         )?;
 
-        match get_today_rewards(&tab) {
+        match get_today_rewards(tab) {
             Ok(points) => {
                 info!("账号 {} 今日搜索积分: {}", email, points);
             }
@@ -126,7 +124,7 @@ fn search(tab: &Tab, browser: &mut Browser, email: &str) -> Result<()> {
         }
 
         if i % 5 == 0 {
-            match get_mobile_search_process(&tab) {
+            match get_mobile_search_process(tab) {
                 Ok((cur_points, max_points)) => {
                     info!(
                         "账号 {} 当前搜索积分: {}，今日最大搜索积分: {}",
@@ -155,7 +153,7 @@ fn get_mobile_search_process(tab: &Tab) -> Result<(u32, u32)> {
     let text = ele.get_inner_text()?;
     let text = text.trim();
     if text == "1级" || text == "一级" {
-        warn!("当前账号处于一级会员，无法获取搜索积分详情");
+        warn!("当前账号处于一级会员，没有移动端搜索积分");
         return Ok((0, 0));
     }
 
@@ -192,7 +190,6 @@ fn get_search_words(tab: &Tab) -> Result<Vec<String>> {
         let selector = scraper::Selector::parse(" #main > div > div.center-section.svelte-1xaaya4 > ul > li > a > div.text.svelte-10xd19r > div.title.svelte-10xd19r ").unwrap();
         let mut hot_words = document
             .select(&selector)
-            .into_iter()
             .take(80)
             .map(|ele| ele.text().collect::<String>())
             .collect::<Vec<_>>();
@@ -211,7 +208,7 @@ fn get_search_words(tab: &Tab) -> Result<Vec<String>> {
     }
 
     info!("返回默认热词");
-    return Ok([
+    Ok([
         "python",
         "bing",
         "ai",
@@ -240,7 +237,7 @@ fn get_search_words(tab: &Tab) -> Result<Vec<String>> {
     ]
     .into_iter()
     .map(|s| s.to_string())
-    .collect());
+    .collect())
 }
 
 fn login_bing_mobile(email: &str, password: &str, tab: &Tab) -> Result<()> {
@@ -253,7 +250,7 @@ fn login_bing_mobile(email: &str, password: &str, tab: &Tab) -> Result<()> {
             tab.reload(false, None).unwrap();
             tab.wait_until_navigated().unwrap();
             sleep(Duration::from_secs(2));
-            click_login_button(&tab)
+            click_login_button(tab)
         },
         3,
     ) {
@@ -270,7 +267,7 @@ fn login_bing_mobile(email: &str, password: &str, tab: &Tab) -> Result<()> {
             ),
             Duration::from_secs(10),
         )
-        .map_err(|e| anyhow::Error::msg(format!("寻找账号输入位置有误：{}", e.to_string())))?;
+        .map_err(|e| anyhow::Error::msg(format!("寻找账号输入位置有误：{}", e)))?;
 
     email_input.type_into(email)?;
 

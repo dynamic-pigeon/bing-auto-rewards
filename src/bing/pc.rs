@@ -22,7 +22,7 @@ impl BingBot {
         let browser = Browser::new(options).unwrap();
         BingBot {
             browser: ManuallyDrop::new(browser),
-            _temp_dir: ManuallyDrop::new(temp_dir),
+            temp_dir: ManuallyDrop::new(temp_dir),
         }
     }
 }
@@ -37,25 +37,22 @@ impl BingBot {
 pub(crate) fn process_account(email: &str, password: &str, browser: &mut Browser) -> Result<()> {
     info!("开始登录Bing账号: {}", email);
     let tab = browser.new_tab()?;
-    login_bing(email, password, &tab).map_err(|e| {
+    login_bing(email, password, &tab).inspect_err(|_| {
         shot_with_faild(&tab, "login", email);
-        e
     })?;
 
     sleep(Duration::from_secs(5));
 
     info!("开始尝试点击卡片");
-    click_rewards(browser, &tab).map_err(|e| {
+    click_rewards(browser, &tab).inspect_err(|_| {
         shot_with_faild(&tab, "click_rewards", email);
-        e
     })?;
 
     sleep(Duration::from_secs(5));
 
     info!("开始进行搜索任务");
-    search(browser, email, &tab).map_err(|e| {
+    search(browser, email, &tab).inspect_err(|_| {
         shot_with_faild(&tab, "search", email);
-        e
     })?;
 
     info!("{} 账号处理完成", email);
@@ -133,7 +130,7 @@ fn search(browser: &mut Browser, email: &str, tab: &Tab) -> Result<()> {
             3,
         )?;
 
-        match get_today_rewards(&tab) {
+        match get_today_rewards(tab) {
             Ok(points) => {
                 info!("账号 {} 今日搜索积分: {}", email, points);
             }
@@ -143,7 +140,7 @@ fn search(browser: &mut Browser, email: &str, tab: &Tab) -> Result<()> {
         }
 
         if i % 5 == 0 {
-            match get_pc_search_process(&tab) {
+            match get_pc_search_process(tab) {
                 Ok((cur_points, max_points)) => {
                     info!(
                         "账号 {} 当前搜索积分: {}，今日最大搜索积分: {}",
@@ -177,13 +174,7 @@ fn click_rewards(browser: &mut Browser, tab: &Tab) -> Result<()> {
     let cards = tab
         .find_elements(".c-card-content a")?
         .into_iter()
-        .filter(|ele| {
-            if let Ok(_) = ele.find_element(".mee-icon-AddMedium") {
-                true
-            } else {
-                false
-            }
-        })
+        .filter(|ele| ele.find_element(".mee-icon-AddMedium").is_ok())
         .collect::<Vec<_>>();
 
     info!("找到 {} 个可点击卡片", cards.len());
@@ -215,7 +206,7 @@ fn login_bing(email: &str, password: &str, tab: &Tab) -> Result<()> {
             tab.reload(false, None).unwrap();
             tab.wait_until_navigated().unwrap();
             sleep(Duration::from_secs(2));
-            click_login_button(&tab)
+            click_login_button(tab)
         },
         3,
     ) {
@@ -232,7 +223,7 @@ fn login_bing(email: &str, password: &str, tab: &Tab) -> Result<()> {
             ),
             Duration::from_secs(10),
         )
-        .map_err(|e| anyhow::Error::msg(format!("寻找账号输入位置有误：{}", e.to_string())))?;
+        .map_err(|e| anyhow::Error::msg(format!("寻找账号输入位置有误：{}", e)))?;
 
     email_input.type_into(email)?;
 
@@ -397,7 +388,6 @@ fn get_search_words(tab: &Tab) -> Result<Vec<String>> {
 
         let mut hot_words = document
             .select(&selector)
-            .into_iter()
             .take(80)
             .map(|ele| ele.text().collect::<String>())
             .collect::<Vec<_>>();
@@ -433,7 +423,6 @@ fn get_search_words(tab: &Tab) -> Result<Vec<String>> {
         .unwrap();
         let mut hot_words = document
             .select(&selector)
-            .into_iter()
             .take(80)
             .map(|ele| ele.text().collect::<String>())
             .collect::<Vec<_>>();
@@ -453,7 +442,8 @@ fn get_search_words(tab: &Tab) -> Result<Vec<String>> {
     warn!("获取微博热搜失败");
 
     info!("返回默认热词");
-    return Ok([
+
+    Ok([
         "python",
         "bing",
         "ai",
@@ -482,5 +472,5 @@ fn get_search_words(tab: &Tab) -> Result<Vec<String>> {
     ]
     .into_iter()
     .map(|s| s.to_string())
-    .collect());
+    .collect())
 }

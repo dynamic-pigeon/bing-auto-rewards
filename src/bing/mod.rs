@@ -22,15 +22,16 @@ const GAP_RANGE: std::ops::Range<u64> = 200..400;
 /// 需要保证 temp_dir 的生命周期长于 browser
 pub(crate) struct BingBot {
     pub(crate) browser: ManuallyDrop<Browser>,
-    _temp_dir: ManuallyDrop<tempfile::TempDir>,
+    temp_dir: ManuallyDrop<tempfile::TempDir>,
 }
 
 impl Drop for BingBot {
     fn drop(&mut self) {
         unsafe {
             ManuallyDrop::drop(&mut self.browser);
+            // 等待一会儿，确保浏览器进程退出
             sleep(Duration::from_secs(5));
-            ManuallyDrop::drop(&mut self._temp_dir);
+            ManuallyDrop::drop(&mut self.temp_dir);
         }
     }
 }
@@ -73,7 +74,7 @@ pub(crate) fn process<P: AsRef<Path>>(config_file: P) -> Result<()> {
                     sleep(time::Duration::from_secs(3));
                 }
 
-                let mut bot = BingBot::new_mobile();
+                let mut bot = BingBot::new_mobile_browser();
                 for account in group.accounts {
                     if let Err(e) =
                         mobile::process_account(&account.email, &account.password, &mut bot.browser)
@@ -103,7 +104,7 @@ fn get_today_rewards(tab: &Tab) -> Result<String> {
         Duration::from_secs(5),
     )?;
 
-    Ok(ele.get_inner_text()?)
+    ele.get_inner_text()
 }
 
 fn shot_with_faild(tab: &Tab, prefix: &str, account: &str) {
