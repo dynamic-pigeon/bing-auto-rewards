@@ -6,7 +6,7 @@ use rand::seq::SliceRandom;
 
 use crate::bing::{
     BING_URL, BingBot, GAP_RANGE, HEADLESS, SLEEP_RANGE, close_tab, get_today_rewards, retry,
-    shot_with_faild,
+    shot_when_faild,
 };
 
 use anyhow::{Result, anyhow};
@@ -31,14 +31,14 @@ pub(crate) fn process_account(email: &str, password: &str, browser: &mut Browser
     let tab = browser.new_tab()?;
     info!("开始处理移动端账号: {}", email);
     login_bing_mobile(email, password, &tab).inspect_err(|_| {
-        shot_with_faild(&tab, "mobile_login", email);
+        shot_when_faild(&tab, "mobile_login", email);
     })?;
 
     sleep(Duration::from_secs(5));
 
     info!("账号 {} 登录成功，开始搜索任务", email);
     search(&tab, browser, email).inspect_err(|_| {
-        shot_with_faild(&tab, "mobile_search", email);
+        shot_when_faild(&tab, "mobile_search", email);
     })?;
     Ok(())
 }
@@ -83,7 +83,7 @@ fn search(tab: &Tab, browser: &mut Browser, email: &str) -> Result<()> {
 
                 let search_input = tab
                     .wait_for_xpath_with_custom_timeout(
-                        "//input[@name='q']",
+                        "//input[@name='q']|//*[@id='sb_form_q']",
                         Duration::from_secs(10),
                     )
                     .map_err(|e| anyhow::Error::msg(format!("寻找输入框失败：{}", e)))?;
@@ -123,7 +123,7 @@ fn search(tab: &Tab, browser: &mut Browser, email: &str) -> Result<()> {
             }
         }
 
-        if i % 5 == 0 {
+        if (i + 1) % 5 == 4 {
             match get_mobile_search_process(tab) {
                 Ok((cur_points, max_points)) => {
                     info!(

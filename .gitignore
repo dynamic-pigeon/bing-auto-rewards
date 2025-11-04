@@ -1,5 +1,5 @@
 
-accounts.json
+config.json
 
 /target
 .vscode
@@ -10,3 +10,6 @@ accounts.json
 *.png
 
 tmp.py
+
+failed
+tmp

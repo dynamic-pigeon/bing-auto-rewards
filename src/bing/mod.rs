@@ -38,12 +38,8 @@ impl Drop for BingBot {
 
 #[derive(serde::Deserialize)]
 struct Config {
-    groups: Vec<Group>,
-}
-
-#[derive(serde::Deserialize)]
-struct Group {
     accounts: Vec<Account>,
+    max_threads: Option<usize>,
 }
 
 #[derive(serde::Deserialize)]
@@ -57,25 +53,27 @@ pub(crate) fn process<P: AsRef<Path>>(config_file: P) -> Result<()> {
 
     let config: Config = serde_json::from_reader(config_file)?;
 
-    let handlers = config
-        .groups
-        .into_iter()
-        .enumerate()
-        .map(|(i, group)| {
+    let (tx, rx) = crossbeam::channel::unbounded();
+
+    let max_threads = config.max_threads.unwrap_or(1);
+
+    let handlers = (1..=max_threads)
+        .map(|i| {
+            let rx: crossbeam::channel::Receiver<Account> = rx.clone();
             spawn(move || {
-                let mut bot = BingBot::new_pc_browser();
-                info!("==== 开始处理第 {} 组账号 ====", i + 1);
-                for account in &group.accounts {
+                info!("==== 第 {} 个线程启动 ====", i);
+                for account in rx {
+                    info!("==== 第 {} 个线程处理账号 {} ====", i, account.email);
+
+                    let mut bot = BingBot::new_pc_browser();
                     if let Err(e) =
                         pc::process_account(&account.email, &account.password, &mut bot.browser)
                     {
                         error!("处理账号 {} 失败: {}", account.email, e);
                     }
                     sleep(time::Duration::from_secs(3));
-                }
 
-                let mut bot = BingBot::new_mobile_browser();
-                for account in group.accounts {
+                    let mut bot = BingBot::new_mobile_browser();
                     if let Err(e) =
                         mobile::process_account(&account.email, &account.password, &mut bot.browser)
                     {
@@ -83,10 +81,19 @@ pub(crate) fn process<P: AsRef<Path>>(config_file: P) -> Result<()> {
                     }
                     sleep(time::Duration::from_secs(3));
                 }
-                info!("==== 第 {} 组账号处理完成 ====", i + 1);
+
+                info!("==== 第 {} 个线程结束 ====", i);
             })
         })
         .collect::<Vec<_>>();
+
+    drop(rx);
+
+    for account in config.accounts {
+        tx.send(account)?;
+    }
+
+    drop(tx);
 
     for handler in handlers {
         let _ = handler.join();
@@ -107,16 +114,17 @@ fn get_today_rewards(tab: &Tab) -> Result<String> {
     ele.get_inner_text()
 }
 
-fn shot_with_faild(tab: &Tab, prefix: &str, account: &str) {
+fn shot_when_faild(tab: &Tab, prefix: &str, account: &str) {
     if let Ok(png) = tab.capture_screenshot(
         headless_chrome::protocol::cdp::Page::CaptureScreenshotFormatOption::Png,
         None,
         None,
         true,
     ) {
+        std::fs::create_dir_all("failed").ok();
         let file_name = format!("{}_failure_{}.png", prefix, account);
-        if let Err(e) = std::fs::write(&file_name, &png) {
-            warn!("保存失败截图 {} 失败: {}", file_name, e);
+        if let Err(e) = std::fs::write(Path::new("failed").join(&file_name), &png) {
+            warn!("保存失败截图 failed/{} 失败: {}", file_name, e);
         } else {
             info!("失败截图已保存为 {}", file_name);
         }

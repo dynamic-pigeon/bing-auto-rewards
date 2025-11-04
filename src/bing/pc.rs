@@ -6,7 +6,7 @@ use rand::seq::SliceRandom;
 
 use crate::bing::{
     BING_URL, BingBot, GAP_RANGE, HEADLESS, REWARDS_URL, SLEEP_RANGE, close_tab, get_today_rewards,
-    retry, shot_with_faild,
+    retry, shot_when_faild,
 };
 
 use anyhow::{Result, anyhow};
@@ -38,21 +38,21 @@ pub(crate) fn process_account(email: &str, password: &str, browser: &mut Browser
     info!("开始登录Bing账号: {}", email);
     let tab = browser.new_tab()?;
     login_bing(email, password, &tab).inspect_err(|_| {
-        shot_with_faild(&tab, "login", email);
+        shot_when_faild(&tab, "login", email);
     })?;
 
     sleep(Duration::from_secs(5));
 
     info!("开始尝试点击卡片");
     click_rewards(browser, &tab).inspect_err(|_| {
-        shot_with_faild(&tab, "click_rewards", email);
+        shot_when_faild(&tab, "click_rewards", email);
     })?;
 
     sleep(Duration::from_secs(5));
 
     info!("开始进行搜索任务");
     search(browser, email, &tab).inspect_err(|_| {
-        shot_with_faild(&tab, "search", email);
+        shot_when_faild(&tab, "search", email);
     })?;
 
     info!("{} 账号处理完成", email);
@@ -99,7 +99,7 @@ fn search(browser: &mut Browser, email: &str, tab: &Tab) -> Result<()> {
 
                 let search_input = tab
                     .wait_for_xpath_with_custom_timeout(
-                        "//input[@name='q']",
+                        "//input[@name='q']|//*[@id='sb_form_q']",
                         Duration::from_secs(10),
                     )
                     .map_err(|e| anyhow::Error::msg(format!("寻找输入框失败：{}", e)))?;
@@ -139,7 +139,8 @@ fn search(browser: &mut Browser, email: &str, tab: &Tab) -> Result<()> {
             }
         }
 
-        if i % 5 == 0 {
+        // 在要睡很久之前检查一次
+        if (i + 1) % 5 == 4 {
             match get_pc_search_process(tab) {
                 Ok((cur_points, max_points)) => {
                     info!(
@@ -308,17 +309,19 @@ fn click_login_button(tab: &Tab) -> Result<()> {
     let login_button = || -> Result<Element<'_>> {
         let button = tab.wait_for_xpath_with_custom_timeout(concat!(
             "//span[@id='id_s']",
+            "|//*[@id='id_a']",
             "//a[@id='id_l']",
             "|//a[span[text()='登录'] or span[text()='Sign in'] or span[text()='登入']]",
             "|//a[contains(@aria-label, '登录') or contains(@aria-label, 'Sign in') or contains(@aria-label, '登入')]",
             "|//a[contains(text(), '登录') or contains(text(), 'Sign in') or contains(text(), '登入')]",
             "|//button[span[text()='登录'] or span[text()='Sign in'] or span[text()='登入']]",
             "|//button[contains(@aria-label, '登录') or contains(@aria-label, 'Sign in') or contains(@aria-label, '登入')]",
-            "|//button[contains(text(), '登录') or contains(text(), 'Sign in') or contains(text(), '登入')]"
+            "|//button[contains(text(), '登录') or contains(text(), 'Sign in') or contains(text(), '登入')]",
         ), Duration::from_secs(10))?;
         Ok(button)
     }()?;
     info!("找到登录按钮，准备点击");
+    sleep(Duration::from_secs(2));
     login_button.click()?;
     tab.wait_until_navigated()?;
     Ok(())
