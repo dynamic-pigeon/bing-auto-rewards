@@ -22,16 +22,18 @@ const GAP_RANGE: std::ops::Range<u64> = 200..400;
 /// 需要保证 temp_dir 的生命周期长于 browser
 pub(crate) struct BingBot {
     pub(crate) browser: ManuallyDrop<Browser>,
-    temp_dir: ManuallyDrop<tempfile::TempDir>,
+    temp_dir: Option<ManuallyDrop<tempfile::TempDir>>,
 }
 
 impl Drop for BingBot {
     fn drop(&mut self) {
         unsafe {
             ManuallyDrop::drop(&mut self.browser);
-            // 等待一会儿，确保浏览器进程退出
-            sleep(Duration::from_secs(5));
-            ManuallyDrop::drop(&mut self.temp_dir);
+            self.temp_dir.take().map(|mut dir| {
+                // 等待一会儿，确保浏览器进程退出
+                sleep(Duration::from_secs(3));
+                ManuallyDrop::drop(&mut dir)
+            });
         }
     }
 }
@@ -40,6 +42,7 @@ impl Drop for BingBot {
 struct Config {
     accounts: Vec<Account>,
     max_threads: Option<usize>,
+    store_local: Option<bool>,
 }
 
 #[derive(serde::Deserialize)]
@@ -56,6 +59,7 @@ pub(crate) fn process<P: AsRef<Path>>(config_file: P) -> Result<()> {
     let (tx, rx) = crossbeam::channel::unbounded();
 
     let max_threads = config.max_threads.unwrap_or(1);
+    let store_local = config.store_local.unwrap_or(false);
 
     let handlers = (1..=max_threads)
         .map(|i| {
@@ -65,7 +69,7 @@ pub(crate) fn process<P: AsRef<Path>>(config_file: P) -> Result<()> {
                 for account in rx {
                     info!("==== 第 {} 个线程处理账号 {} ====", i, account.email);
 
-                    let mut bot = BingBot::new_pc_browser();
+                    let mut bot = BingBot::new_pc_browser(store_local, &account.email);
                     if let Err(e) =
                         pc::process_account(&account.email, &account.password, &mut bot.browser)
                     {
@@ -73,7 +77,9 @@ pub(crate) fn process<P: AsRef<Path>>(config_file: P) -> Result<()> {
                     }
                     sleep(time::Duration::from_secs(3));
 
-                    let mut bot = BingBot::new_mobile_browser();
+                    drop(bot);
+
+                    let mut bot = BingBot::new_mobile_browser(store_local, &account.email);
                     if let Err(e) =
                         mobile::process_account(&account.email, &account.password, &mut bot.browser)
                     {

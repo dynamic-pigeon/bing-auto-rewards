@@ -12,17 +12,32 @@ use crate::bing::{
 use anyhow::{Result, anyhow};
 
 impl BingBot {
-    pub(crate) fn new_mobile_browser() -> Self {
+    pub(crate) fn new_mobile_browser(_store_local: bool, account: &str) -> Self {
         std::fs::create_dir_all("./tmp").unwrap();
-        let temp_dir = tempfile::tempdir_in("./tmp").unwrap();
+        let temp_dir = None;
+
+        // mobile 的 cookie 不生效，为什么？
+        // 总之先不存储了
+        let store_local = false;
+
+        let user_dir = if store_local {
+            std::fs::create_dir_all("./user-data").unwrap();
+            Some(std::path::PathBuf::from(format!(
+                "./user-data/mobile_{}",
+                account
+            )))
+        } else {
+            let dir = tempfile::TempDir::new_in("./tmp").unwrap();
+            Some(dir.path().to_path_buf())
+        };
         let options = default_options_builder()
-            .user_data_dir(Some(temp_dir.path().to_path_buf()))
+            .user_data_dir(user_dir)
             .build()
             .unwrap();
         let browser = Browser::new(options).unwrap();
         BingBot {
             browser: ManuallyDrop::new(browser),
-            temp_dir: ManuallyDrop::new(temp_dir),
+            temp_dir,
         }
     }
 }
@@ -47,6 +62,24 @@ fn search(tab: &Tab, browser: &mut Browser, email: &str) -> Result<()> {
     let search_words = get_search_words(tab)?;
 
     for (i, word) in search_words.into_iter().enumerate() {
+        if i % 5 == 0 {
+            match get_mobile_search_process(tab) {
+                Ok((cur_points, max_points)) => {
+                    info!(
+                        "账号 {} 当前搜索积分: {}，今日最大搜索积分: {}",
+                        email, cur_points, max_points
+                    );
+                    if cur_points >= max_points {
+                        info!("账号 {} 今日搜索积分已达上限，结束搜索任务", email);
+                        break;
+                    }
+                }
+                Err(e) => {
+                    warn!("获取账号 {} 积分详情失败: {}", email, e);
+                }
+            }
+        }
+
         let sleep_time = if (i + 1) % 5 == 0 {
             rand::random_range(GAP_RANGE)
         } else {
@@ -120,24 +153,6 @@ fn search(tab: &Tab, browser: &mut Browser, email: &str) -> Result<()> {
             }
             Err(e) => {
                 warn!("获取账号 {} 今日积分失败: {}", email, e);
-            }
-        }
-
-        if (i + 1) % 5 == 4 {
-            match get_mobile_search_process(tab) {
-                Ok((cur_points, max_points)) => {
-                    info!(
-                        "账号 {} 当前搜索积分: {}，今日最大搜索积分: {}",
-                        email, cur_points, max_points
-                    );
-                    if cur_points >= max_points {
-                        info!("账号 {} 今日搜索积分已达上限，结束搜索任务", email);
-                        break;
-                    }
-                }
-                Err(e) => {
-                    warn!("获取账号 {} 积分详情失败: {}", email, e);
-                }
             }
         }
     }
@@ -241,8 +256,10 @@ fn get_search_words(tab: &Tab) -> Result<Vec<String>> {
 }
 
 fn login_bing_mobile(email: &str, password: &str, tab: &Tab) -> Result<()> {
-    // Implement login logic here
-    tab.navigate_to(BING_URL).unwrap();
+    if check_login_status(&tab)? {
+        info!("账号 {} 已登录，无需重复登录", email);
+        return Ok(());
+    }
     sleep(Duration::from_secs(2));
 
     if let Err(e) = retry(
@@ -348,6 +365,28 @@ fn login_bing_mobile(email: &str, password: &str, tab: &Tab) -> Result<()> {
     Ok(())
 }
 
+fn check_login_status(tab: &Tab) -> Result<bool> {
+    tab.navigate_to(BING_URL)?;
+    tab.wait_until_navigated()?;
+    tab.reload(false, None)?;
+
+    let login_button =
+        tab.wait_for_element_with_custom_timeout("#mHamburger", Duration::from_secs(5))?;
+
+    login_button.click()?;
+
+    match tab.wait_for_element_with_custom_timeout("#hb_n", Duration::from_secs(5)) {
+        Ok(ele) => {
+            let status = ele.get_attribute_value("style")?;
+            match status.as_ref().map(|s| s.as_str()) {
+                Some("display:none") => Ok(false),
+                _ => Ok(true),
+            }
+        }
+        Err(_) => Ok(false),
+    }
+}
+
 fn click_login_button(tab: &Tab) -> Result<()> {
     let login_button =
         tab.wait_for_element_with_custom_timeout("#mHamburger", Duration::from_secs(5))?;
@@ -369,13 +408,12 @@ fn default_options_builder() -> LaunchOptionsBuilder<'static> {
         .window_size(Some((770, 1600)))
         .args(
             [
-                "--incognito",
                 "--disable-dev-shm-usage",
                 "--disable-extensions",
                 "--disable-blink-features=AutomationControlled",
                 "--no-sandbox",
                 "--allow-running-insecure-content",
-                "--user-agent=Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Mobile Safari/537.36"
+                "--user-agent=Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Mobile Safari/537.36",
             ]
             .into_iter()
             .map(std::ffi::OsStr::new)
