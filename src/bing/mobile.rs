@@ -1,18 +1,22 @@
-use std::{mem::ManuallyDrop, thread::sleep, time::Duration};
+use std::{mem::ManuallyDrop, path::PathBuf, thread::sleep, time::Duration};
 
 use headless_chrome::{Browser, LaunchOptionsBuilder, Tab};
 use log::{debug, info, warn};
 use rand::seq::SliceRandom;
 
 use crate::bing::{
-    BING_URL, BingBot, GAP_RANGE, HEADLESS, SLEEP_RANGE, close_tab, get_today_rewards, retry,
-    shot_when_faild,
+    BING_URL, BingBot, GAP_RANGE, HEADLESS, SLEEP_RANGE, close_tab, get_today_rewards,
+    retry::Retryable, shot_when_faild,
 };
 
 use anyhow::{Result, anyhow};
 
 impl BingBot {
-    pub(crate) fn new_mobile_browser(_store_local: bool, account: &str) -> Self {
+    pub(crate) fn new_mobile_browser(
+        _store_local: bool,
+        account: &str,
+        browser_path: &Option<String>,
+    ) -> Self {
         std::fs::create_dir_all("./tmp").unwrap();
         let temp_dir = None;
 
@@ -30,7 +34,9 @@ impl BingBot {
             let dir = tempfile::TempDir::new_in("./tmp").unwrap();
             Some(dir.path().to_path_buf())
         };
+
         let options = default_options_builder()
+            .path(browser_path.clone().map(|s| PathBuf::from(s)))
             .user_data_dir(user_dir)
             .build()
             .unwrap();
@@ -45,7 +51,21 @@ impl BingBot {
 pub(crate) fn process_account(email: &str, password: &str, browser: &mut Browser) -> Result<()> {
     let tab = browser.new_tab()?;
     info!("开始处理移动端账号: {}", email);
-    login_bing_mobile(email, password, &tab).inspect_err(|_| {
+    // 重试三次登录
+    (|| {
+        if !check_login_status(&tab)? {
+            login_bing_mobile(email, password, &tab)?;
+            if !check_login_status(&tab)? {
+                return Err(anyhow!("登录后检查状态发现未登录"));
+            }
+        } else {
+            info!("账号 {} 已登录，无需重复登录", email);
+        }
+
+        Ok(())
+    })
+    .retry(3)
+    .inspect_err(|_| {
         shot_when_faild(&tab, "mobile_login", email);
     })?;
 
@@ -86,8 +106,14 @@ fn search(tab: &Tab, browser: &mut Browser, email: &str) -> Result<()> {
             rand::random_range(SLEEP_RANGE)
         };
 
-        info!("{} 秒后开始第 {} 次搜索：{}", sleep_time, i + 1, word);
-        const MAX_SLEEP_TIME: u64 = 10;
+        info!(
+            "{} {} 秒后开始第 {} 次搜索：{}",
+            email,
+            sleep_time,
+            i + 1,
+            word
+        );
+        const MAX_SLEEP_TIME: u64 = 60;
         if sleep_time < MAX_SLEEP_TIME {
             sleep(Duration::from_secs(sleep_time));
         } else {
@@ -101,51 +127,49 @@ fn search(tab: &Tab, browser: &mut Browser, email: &str) -> Result<()> {
             }
         }
 
-        retry(
-            || {
-                use anyhow::Error;
-                tab.activate()
-                    .map_err(|e| Error::msg(format!("activate 失败：{}", e)))?;
-                tab.navigate_to(BING_URL)
-                    .map_err(|e| Error::msg(format!("前往 BING_URL失败：{}", e)))?;
-                sleep(Duration::from_secs(2));
-                tab.reload(false, None)
-                    .map_err(|e| Error::msg(format!("重新加载失败：{}", e)))?;
+        (|| {
+            use anyhow::Error;
+            tab.activate()
+                .map_err(|e| Error::msg(format!("activate 失败：{}", e)))?;
+            tab.navigate_to(BING_URL)
+                .map_err(|e| Error::msg(format!("前往 BING_URL失败：{}", e)))?;
+            sleep(Duration::from_secs(2));
+            tab.reload(false, None)
+                .map_err(|e| Error::msg(format!("重新加载失败：{}", e)))?;
 
-                sleep(Duration::from_secs(1));
+            sleep(Duration::from_secs(1));
 
-                let search_input = tab
-                    .wait_for_xpath_with_custom_timeout(
-                        "//input[@name='q']|//*[@id='sb_form_q']",
-                        Duration::from_secs(10),
-                    )
-                    .map_err(|e| anyhow::Error::msg(format!("寻找输入框失败：{}", e)))?;
+            let search_input = tab
+                .wait_for_xpath_with_custom_timeout(
+                    "//input[@name='q']|//*[@id='sb_form_q']",
+                    Duration::from_secs(10),
+                )
+                .map_err(|e| anyhow::Error::msg(format!("寻找输入框失败：{}", e)))?;
 
-                search_input
-                    .type_into(&word)
-                    .map_err(|e| Error::msg(format!("输入失败：{}", e)))?;
+            search_input
+                .type_into(&word)
+                .map_err(|e| Error::msg(format!("输入失败：{}", e)))?;
 
-                debug!("输入搜索词：{} 成功", &word);
+            debug!("输入搜索词：{} 成功", &word);
 
-                let before_tabs = browser.get_tabs().lock().unwrap().clone();
+            let before_tabs = browser.get_tabs().lock().unwrap().clone();
 
-                let search_button = tab
-                    .find_element_by_xpath("//label[@id='search_icon']")
-                    .map_err(|e| Error::msg(format!("寻找搜索按钮失败：{}", e)))?;
-                search_button
-                    .click()
-                    .map_err(|e| anyhow::Error::msg(format!("搜索按钮点击失败：{}", e)))?;
+            let search_button = tab
+                .find_element_by_xpath("//label[@id='search_icon']")
+                .map_err(|e| Error::msg(format!("寻找搜索按钮失败：{}", e)))?;
+            search_button
+                .click()
+                .map_err(|e| anyhow::Error::msg(format!("搜索按钮点击失败：{}", e)))?;
 
-                sleep(Duration::from_secs(rand::random_range(5..10)));
+            sleep(Duration::from_secs(rand::random_range(5..10)));
 
-                close_tab(before_tabs, browser)?;
+            close_tab(before_tabs, browser)?;
 
-                info!("第 {} 次搜索完成", i + 1);
+            info!("第 {} 次搜索完成", i + 1);
 
-                Ok(())
-            },
-            3,
-        )?;
+            Ok(())
+        })
+        .retry(3)?;
 
         match get_today_rewards(tab) {
             Ok(points) => {
@@ -174,7 +198,7 @@ fn get_mobile_search_process(tab: &Tab) -> Result<(u32, u32)> {
 
     let ele = tab.wait_for_element_with_custom_timeout(
         "#userPointsBreakdown > div > div:nth-child(2) > div > div:nth-child(2) > div > div.pointsDetail > mee-rewards-user-points-details > div > div > div > div > p.pointsDetail.c-subheading-3.ng-binding",
-        Duration::from_secs(15),
+        Duration::from_secs(5),
     )?;
 
     let text = ele.get_inner_text()?;
@@ -211,7 +235,6 @@ fn get_search_words(tab: &Tab) -> Result<Vec<String>> {
 
         hot_words.shuffle(&mut rand::rng());
 
-        let hot_words = hot_words.into_iter().take(40).collect::<Vec<_>>();
         if !hot_words.is_empty() {
             info!("成功获取到搜索热词");
             Ok(hot_words)
@@ -256,21 +279,17 @@ fn get_search_words(tab: &Tab) -> Result<Vec<String>> {
 }
 
 fn login_bing_mobile(email: &str, password: &str, tab: &Tab) -> Result<()> {
-    if check_login_status(&tab)? {
-        info!("账号 {} 已登录，无需重复登录", email);
-        return Ok(());
-    }
-    sleep(Duration::from_secs(2));
+    tab.navigate_to(BING_URL)?;
+    tab.wait_until_navigated()?;
 
-    if let Err(e) = retry(
-        || {
-            tab.reload(false, None).unwrap();
-            tab.wait_until_navigated().unwrap();
-            sleep(Duration::from_secs(2));
-            click_login_button(tab)
-        },
-        3,
-    ) {
+    if let Err(e) = (|| {
+        tab.reload(false, None)?;
+        tab.wait_until_navigated()?;
+        sleep(Duration::from_secs(2));
+        click_login_button(tab)
+    })
+    .retry(3)
+    {
         warn!("点击登录按钮失败: {}", e);
         return Err(e);
     }
@@ -378,7 +397,7 @@ fn check_login_status(tab: &Tab) -> Result<bool> {
     match tab.wait_for_element_with_custom_timeout("#hb_n", Duration::from_secs(5)) {
         Ok(ele) => {
             let status = ele.get_attribute_value("style")?;
-            match status.as_ref().map(|s| s.as_str()) {
+            match status.as_deref() {
                 Some("display:none") => Ok(false),
                 _ => Ok(true),
             }
@@ -406,6 +425,7 @@ fn default_options_builder() -> LaunchOptionsBuilder<'static> {
         .headless(HEADLESS)
         .enable_gpu(false)
         .window_size(Some((770, 1600)))
+        .idle_browser_timeout(Duration::from_mins(2))
         .args(
             [
                 "--disable-dev-shm-usage",

@@ -1,18 +1,22 @@
-use std::{mem::ManuallyDrop, thread::sleep, time::Duration};
+use std::{mem::ManuallyDrop, path::PathBuf, thread::sleep, time::Duration};
 
-use headless_chrome::{Browser, Element, LaunchOptionsBuilder, Tab};
+use headless_chrome::{Browser, LaunchOptionsBuilder, Tab};
 use log::{debug, info, warn};
 use rand::seq::SliceRandom;
 
 use crate::bing::{
     BING_URL, BingBot, GAP_RANGE, HEADLESS, REWARDS_URL, SLEEP_RANGE, close_tab, get_today_rewards,
-    retry, shot_when_faild,
+    retry::Retryable, shot_when_faild,
 };
 
 use anyhow::{Result, anyhow};
 
 impl BingBot {
-    pub(crate) fn new_pc_browser(store_local: bool, account: &str) -> BingBot {
+    pub(crate) fn new_pc_browser(
+        store_local: bool,
+        account: &str,
+        browser_path: &Option<String>,
+    ) -> BingBot {
         std::fs::create_dir_all("./tmp").unwrap();
         let temp_dir = None;
 
@@ -27,6 +31,7 @@ impl BingBot {
             Some(dir.path().to_path_buf())
         };
         let options = default_options_builder()
+            .path(browser_path.clone().map(|s| PathBuf::from(s)))
             .user_data_dir(user_dir)
             .build()
             .unwrap();
@@ -48,7 +53,20 @@ impl BingBot {
 pub(crate) fn process_account(email: &str, password: &str, browser: &mut Browser) -> Result<()> {
     info!("开始登录Bing账号: {}", email);
     let tab = browser.new_tab()?;
-    login_bing(email, password, &tab).inspect_err(|_| {
+    (|| {
+        if !check_login_status(&tab)? {
+            login_bing(email, password, &tab)?;
+            if !check_login_status(&tab)? {
+                return Err(anyhow!("登录后检查状态仍然未登录"));
+            }
+        } else {
+            info!("账号 {} 已登录，无需重复登录", email);
+        }
+
+        Ok(())
+    })
+    .retry(3)
+    .inspect_err(|_| {
         shot_when_faild(&tab, "login", email);
     })?;
 
@@ -97,8 +115,14 @@ fn search(browser: &mut Browser, email: &str, tab: &Tab) -> Result<()> {
             rand::random_range(SLEEP_RANGE)
         };
 
-        info!("{} 秒后开始第 {} 次搜索：{}", sleep_time, i + 1, word);
-        const MAX_SLEEP_TIME: u64 = 10;
+        info!(
+            "{} {} 秒后开始第 {} 次搜索：{}",
+            email,
+            sleep_time,
+            i + 1,
+            word
+        );
+        const MAX_SLEEP_TIME: u64 = 60;
         if sleep_time < MAX_SLEEP_TIME {
             sleep(Duration::from_secs(sleep_time));
         } else {
@@ -112,51 +136,49 @@ fn search(browser: &mut Browser, email: &str, tab: &Tab) -> Result<()> {
             }
         }
 
-        retry(
-            || {
-                use anyhow::Error;
-                tab.activate()
-                    .map_err(|e| Error::msg(format!("activate 失败：{}", e)))?;
-                tab.navigate_to(BING_URL)
-                    .map_err(|e| Error::msg(format!("前往 BING_URL失败：{}", e)))?;
-                sleep(Duration::from_secs(2));
-                tab.reload(false, None)
-                    .map_err(|e| Error::msg(format!("重新加载失败：{}", e)))?;
+        (|| {
+            use anyhow::Error;
+            tab.activate()
+                .map_err(|e| Error::msg(format!("activate 失败：{}", e)))?;
+            tab.navigate_to(BING_URL)
+                .map_err(|e| Error::msg(format!("前往 BING_URL失败：{}", e)))?;
+            sleep(Duration::from_secs(2));
+            tab.reload(false, None)
+                .map_err(|e| Error::msg(format!("重新加载失败：{}", e)))?;
 
-                sleep(Duration::from_secs(1));
+            sleep(Duration::from_secs(1));
 
-                let search_input = tab
-                    .wait_for_xpath_with_custom_timeout(
-                        "//input[@name='q']|//*[@id='sb_form_q']",
-                        Duration::from_secs(10),
-                    )
-                    .map_err(|e| anyhow::Error::msg(format!("寻找输入框失败：{}", e)))?;
+            let search_input = tab
+                .wait_for_xpath_with_custom_timeout(
+                    "//input[@name='q']|//*[@id='sb_form_q']",
+                    Duration::from_secs(10),
+                )
+                .map_err(|e| anyhow::Error::msg(format!("寻找输入框失败：{}", e)))?;
 
-                search_input
-                    .type_into(&word)
-                    .map_err(|e| Error::msg(format!("输入失败：{}", e)))?;
+            search_input
+                .type_into(&word)
+                .map_err(|e| Error::msg(format!("输入失败：{}", e)))?;
 
-                debug!("输入搜索词：{} 成功", &word);
+            debug!("输入搜索词：{} 成功", &word);
 
-                let before_tabs = browser.get_tabs().lock().unwrap().clone();
+            let before_tabs = browser.get_tabs().lock().unwrap().clone();
 
-                let search_button = tab
-                    .find_element_by_xpath("//label[@id='search_icon']")
-                    .map_err(|e| Error::msg(format!("寻找搜索按钮失败：{}", e)))?;
-                search_button
-                    .click()
-                    .map_err(|e| anyhow::Error::msg(format!("搜索按钮点击失败：{}", e)))?;
+            let search_button = tab
+                .find_element_by_xpath("//label[@id='search_icon']")
+                .map_err(|e| Error::msg(format!("寻找搜索按钮失败：{}", e)))?;
+            search_button
+                .click()
+                .map_err(|e| anyhow::Error::msg(format!("搜索按钮点击失败：{}", e)))?;
 
-                sleep(Duration::from_secs(rand::random_range(5..10)));
+            sleep(Duration::from_secs(rand::random_range(5..10)));
 
-                close_tab(before_tabs, browser)?;
+            close_tab(before_tabs, browser)?;
 
-                info!("第 {} 次搜索完成", i + 1);
+            info!("第 {} 次搜索完成", i + 1);
 
-                Ok(())
-            },
-            3,
-        )?;
+            Ok(())
+        })
+        .retry(3)?;
 
         match get_today_rewards(tab) {
             Ok(points) => {
@@ -207,21 +229,17 @@ fn click_rewards(browser: &mut Browser, tab: &Tab) -> Result<()> {
 }
 
 fn login_bing(email: &str, password: &str, tab: &Tab) -> Result<()> {
-    if check_login_status(tab)? {
-        info!("账号 {} 已登录，无需重复登录", email);
-        return Ok(());
-    }
-    sleep(Duration::from_secs(2));
+    tab.navigate_to(BING_URL)?;
+    tab.wait_until_navigated()?;
 
-    if let Err(e) = retry(
-        || {
-            tab.reload(false, None).unwrap();
-            tab.wait_until_navigated().unwrap();
-            sleep(Duration::from_secs(2));
-            click_login_button(tab)
-        },
-        3,
-    ) {
+    if let Err(e) = (|| {
+        tab.reload(false, None)?;
+        tab.wait_until_navigated()?;
+        sleep(Duration::from_secs(2));
+        click_login_button(tab)
+    })
+    .retry(3)
+    {
         warn!("点击登录按钮失败: {}", e);
         return Err(e);
     }
@@ -320,11 +338,12 @@ fn check_login_status(tab: &Tab) -> Result<bool> {
     tab.navigate_to(BING_URL)?;
     tab.wait_until_navigated()?;
     tab.reload(false, None)?;
+    sleep(Duration::from_secs(2));
 
-    match tab.wait_for_element_with_custom_timeout("#id_s", Duration::from_secs(5)) {
+    match tab.wait_for_element_with_custom_timeout("#id_s", Duration::from_secs(3)) {
         Ok(ele) => {
             let status = ele.get_attribute_value("aria-hidden")?;
-            match status.as_ref().map(|s| s.as_str()) {
+            match status.as_deref() {
                 Some("true") => Ok(true),
                 Some("false") => Ok(false),
                 None => Err(anyhow!("没有找到")),
@@ -336,11 +355,10 @@ fn check_login_status(tab: &Tab) -> Result<bool> {
 }
 
 fn click_login_button(tab: &Tab) -> Result<()> {
-    let login_button = || -> Result<Element<'_>> {
-        let button = tab.wait_for_xpath_with_custom_timeout(concat!(
+    let login_button =  tab.wait_for_xpath_with_custom_timeout(concat!(
             "//span[@id='id_s']",
             "|//*[@id='id_a']",
-            "//a[@id='id_l']",
+            "|//a[@id='id_l']",
             "|//a[span[text()='登录'] or span[text()='Sign in'] or span[text()='登入']]",
             "|//a[contains(@aria-label, '登录') or contains(@aria-label, 'Sign in') or contains(@aria-label, '登入')]",
             "|//a[contains(text(), '登录') or contains(text(), 'Sign in') or contains(text(), '登入')]",
@@ -348,8 +366,7 @@ fn click_login_button(tab: &Tab) -> Result<()> {
             "|//button[contains(@aria-label, '登录') or contains(@aria-label, 'Sign in') or contains(@aria-label, '登入')]",
             "|//button[contains(text(), '登录') or contains(text(), 'Sign in') or contains(text(), '登入')]",
         ), Duration::from_secs(10))?;
-        Ok(button)
-    }()?;
+
     info!("找到登录按钮，准备点击");
     sleep(Duration::from_secs(2));
     login_button.click()?;
@@ -363,6 +380,7 @@ fn default_options_builder() -> LaunchOptionsBuilder<'static> {
         .headless(HEADLESS)
         .enable_gpu(false)
         .window_size(Some((1920, 1080)))
+        .idle_browser_timeout(Duration::from_mins(2))
         .args(
             [
                 "--disable-dev-shm-usage",
@@ -426,8 +444,6 @@ fn get_search_words(tab: &Tab) -> Result<Vec<String>> {
 
         hot_words.shuffle(&mut rand::rng());
 
-        let hot_words = hot_words.into_iter().take(40).collect::<Vec<_>>();
-
         if !hot_words.is_empty() {
             info!("成功获取到百度搜索热词");
             Ok(hot_words)
@@ -461,7 +477,6 @@ fn get_search_words(tab: &Tab) -> Result<Vec<String>> {
 
         hot_words.shuffle(&mut rand::rng());
 
-        let hot_words = hot_words.into_iter().take(40).collect::<Vec<_>>();
         if !hot_words.is_empty() {
             info!("成功获取到微博热搜");
             Ok(hot_words)

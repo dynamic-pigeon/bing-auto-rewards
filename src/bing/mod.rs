@@ -1,39 +1,43 @@
 use std::{
     mem::ManuallyDrop,
     path::Path,
+    str::FromStr,
     sync::Arc,
     thread::{sleep, spawn},
     time::{self, Duration},
 };
 
 use anyhow::Result;
+use chrono::Local;
 use headless_chrome::{Browser, Tab};
-use log::{debug, error, info, warn};
+use log::{error, info, warn};
+
+use crate::bing::retry::Retryable;
 
 mod mobile;
 mod pc;
+mod retry;
 
 const HEADLESS: bool = true;
 const BING_URL: &str = "https://www.bing.com/";
 const REWARDS_URL: &str = "https://rewards.bing.com/";
-const SLEEP_RANGE: std::ops::Range<u64> = 10..20;
+const SLEEP_RANGE: std::ops::Range<u64> = 20..30;
 const GAP_RANGE: std::ops::Range<u64> = 200..400;
 
 /// 需要保证 temp_dir 的生命周期长于 browser
 pub(crate) struct BingBot {
     pub(crate) browser: ManuallyDrop<Browser>,
-    temp_dir: Option<ManuallyDrop<tempfile::TempDir>>,
+    temp_dir: Option<tempfile::TempDir>,
 }
 
 impl Drop for BingBot {
     fn drop(&mut self) {
         unsafe {
             ManuallyDrop::drop(&mut self.browser);
-            self.temp_dir.take().map(|mut dir| {
-                // 等待一会儿，确保浏览器进程退出
+            if let Some(dir) = self.temp_dir.take() {
                 sleep(Duration::from_secs(3));
-                ManuallyDrop::drop(&mut dir)
-            });
+                drop(dir);
+            }
         }
     }
 }
@@ -43,9 +47,11 @@ struct Config {
     accounts: Vec<Account>,
     max_threads: Option<usize>,
     store_local: Option<bool>,
+    browser_path: Option<String>,
+    sechedule: Option<String>,
 }
 
-#[derive(serde::Deserialize)]
+#[derive(serde::Deserialize, Clone)]
 struct Account {
     email: String,
     password: String,
@@ -56,6 +62,32 @@ pub(crate) fn process<P: AsRef<Path>>(config_file: P) -> Result<()> {
 
     let config: Config = serde_json::from_reader(config_file)?;
 
+    if let Some(schedule) = config.sechedule.as_deref() {
+        let schedule = croner::Cron::from_str(schedule)
+            .inspect_err(|e| error!("定时任务格式串解析有误：{}", e))?;
+
+        for time in schedule.iter_after(Local::now()) {
+            let now = Local::now();
+            let duration = time.signed_duration_since(now);
+            let duration = duration.to_std().unwrap_or_else(|_| Duration::from_secs(0));
+            info!(
+                "下次任务将在 {} 执行，等待 {} 秒",
+                time.format("%Y-%m-%d %H:%M:%S"),
+                duration.as_secs()
+            );
+            sleep(duration);
+            if let Err(e) = process_once(&config) {
+                error!("定时任务执行失败：{}", e);
+            }
+        }
+    } else {
+        process_once(&config)?;
+    }
+
+    Ok(())
+}
+
+fn process_once(config: &Config) -> Result<()> {
     let (tx, rx) = crossbeam::channel::unbounded();
 
     let max_threads = config.max_threads.unwrap_or(1);
@@ -64,28 +96,37 @@ pub(crate) fn process<P: AsRef<Path>>(config_file: P) -> Result<()> {
     let handlers = (1..=max_threads)
         .map(|i| {
             let rx: crossbeam::channel::Receiver<Account> = rx.clone();
+            let browser_path = config.browser_path.clone();
             spawn(move || {
                 info!("==== 第 {} 个线程启动 ====", i);
                 for account in rx {
                     info!("==== 第 {} 个线程处理账号 {} ====", i, account.email);
 
-                    let mut bot = BingBot::new_pc_browser(store_local, &account.email);
-                    if let Err(e) =
-                        pc::process_account(&account.email, &account.password, &mut bot.browser)
-                    {
-                        error!("处理账号 {} 失败: {}", account.email, e);
-                    }
-                    sleep(time::Duration::from_secs(3));
+                    let _ = (|| {
+                        let mut bot =
+                            BingBot::new_pc_browser(store_local, &account.email, &browser_path);
 
-                    drop(bot);
+                        pc::process_account(&account.email, &account.password, &mut bot.browser)?;
+                        sleep(time::Duration::from_secs(3));
+                        Ok(())
+                    })
+                    .retry(2)
+                    .inspect_err(|e| error!("处理账号 {} 失败: {}", account.email, e));
 
-                    let mut bot = BingBot::new_mobile_browser(store_local, &account.email);
-                    if let Err(e) =
-                        mobile::process_account(&account.email, &account.password, &mut bot.browser)
-                    {
-                        error!("处理账号 {} 失败: {}", account.email, e);
-                    }
-                    sleep(time::Duration::from_secs(3));
+                    let _ = (|| {
+                        let mut bot =
+                            BingBot::new_mobile_browser(store_local, &account.email, &browser_path);
+
+                        mobile::process_account(
+                            &account.email,
+                            &account.password,
+                            &mut bot.browser,
+                        )?;
+                        sleep(time::Duration::from_secs(3));
+                        Ok(())
+                    })
+                    .retry(2)
+                    .inspect_err(|e| error!("处理移动端账号 {} 失败: {}", account.email, e));
                 }
 
                 info!("==== 第 {} 个线程结束 ====", i);
@@ -95,8 +136,8 @@ pub(crate) fn process<P: AsRef<Path>>(config_file: P) -> Result<()> {
 
     drop(rx);
 
-    for account in config.accounts {
-        tx.send(account)?;
+    for account in &config.accounts {
+        tx.send(account.clone())?;
     }
 
     drop(tx);
@@ -104,7 +145,6 @@ pub(crate) fn process<P: AsRef<Path>>(config_file: P) -> Result<()> {
     for handler in handlers {
         let _ = handler.join();
     }
-
     Ok(())
 }
 
@@ -135,21 +175,6 @@ fn shot_when_faild(tab: &Tab, prefix: &str, account: &str) {
             info!("失败截图已保存为 {}", file_name);
         }
     }
-}
-
-fn retry<T>(mut f: impl FnMut() -> Result<T>, times: usize) -> Result<T> {
-    let mut ret = None;
-    for i in 0..times {
-        match f() {
-            Ok(result) => return Ok(result),
-            Err(e) => {
-                debug!("尝试第 {} 次失败: {}", i + 1, e);
-                sleep(Duration::from_secs(2));
-                ret = Some(e);
-            }
-        }
-    }
-    unsafe { Err(ret.unwrap_unchecked()) }
 }
 
 fn close_tab(before_tabs: Vec<Arc<Tab>>, browser: &mut Browser) -> Result<()> {

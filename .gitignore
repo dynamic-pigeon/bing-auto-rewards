@@ -9,7 +9,7 @@ config.json
 
 *.png
 
-tmp.py
+tmp.*
 
 failed
 tmp
