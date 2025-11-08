@@ -2,8 +2,8 @@ name: Release
 
 on:
   push:
-    tags:
-      - "v*.*.*"
+    branches:
+      - master
 
 jobs:
   build-and-release:
@@ -64,7 +64,7 @@ jobs:
             }
           }
           # 根据系统类型创建压缩包
-          $ARCHIVE_NAME = "bing-auto-reward-${{ github.ref_name }}-${{ matrix.target }}"
+          $ARCHIVE_NAME = "bing-auto-reward-latest-${{ matrix.target }}"
           Compress-Archive -Path "$PACKAGE_DIR\*" -DestinationPath "${ARCHIVE_NAME}.zip"
           echo "ASSET_PATH=${ARCHIVE_NAME}.zip" >> $env:GITHUB_ENV
 
@@ -93,7 +93,7 @@ jobs:
           done
           
           # 根据系统类型创建压缩包
-          ARCHIVE_NAME="bing-auto-reward-${{ github.ref_name }}-${{ matrix.target }}"
+          ARCHIVE_NAME="bing-auto-reward-latest-${{ matrix.target }}"
           if [ "${{ matrix.archive_ext }}" = "zip" ]; then
             (cd "$PACKAGE_DIR" && zip -r "../${ARCHIVE_NAME}.zip" .)
             echo "ASSET_PATH=${ARCHIVE_NAME}.zip" >> $GITHUB_ENV

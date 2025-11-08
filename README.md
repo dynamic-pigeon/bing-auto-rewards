@@ -2,7 +2,9 @@
 
 **针对中国区域特调，没有适配其他区域，是否能够使用请自行斟酌**
 
-第一步，你需要在本地安装一个谷歌浏览器（理论上 chromium 内核的浏览器都行，但是不保证兼容性）
+第一步，从 [release](https://github.com/dynamic-pigeon/bing-auto-rewards/releases/) 页面下载可执行文件，或者从源代码编译
+
+第二步你需要在本地安装一个谷歌浏览器（理论上 chromium 内核的浏览器都行，但是不保证兼容性）
 
 然后，你需要在根目录创建 `config.json`，格式大致如下：
 
@@ -27,13 +29,6 @@
     // cron 的定时任务格式（不含秒），see <https://crates.io/crates/croner>，不填就默认只执行一次
     "sechedule": "0 9 * * *"
 }
-```
-
-然后，你再装一个 rust，你就可以启动了！
-
-```rust
-// 编译还挺占用资源的，请不要在低性能设备编译
-cargo run --release
 ```
 
 ## TODO：
