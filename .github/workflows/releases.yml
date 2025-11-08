@@ -76,7 +76,6 @@ jobs:
       - name: Upload Release Asset
         uses: actions/upload-release-asset@v1
         with:
-          upload_url: ${{ github.event.release.upload_url }}
           asset_path: ${{ env.ASSET_PATH }}
           asset_name: ${{ env.ASSET_PATH }}
           asset_content_type: application/octet-stream
