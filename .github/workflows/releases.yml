@@ -42,7 +42,36 @@ jobs:
           RUST_BACKTRACE: 1
 
       - name: Prepare release assets
+        shell: pwsh
+        if: matrix.os == 'windows-latest'
+        run: |
+          # 确定源文件路径
+          $SOURCE_DIR = "target/${{ matrix.target }}/release"
+          $BINARY_PATH = Join-Path $SOURCE_DIR "${{ matrix.binary_name }}"
+
+          # 确定资源文件和目录
+          $RESOURCES = @("config.json", "log4rs.yaml")
+          
+          # 创建临时打包目录
+          $PACKAGE_DIR = "release_package"
+          New-Item -ItemType Directory -Path $PACKAGE_DIR | Out-Null
+
+          # 复制二进制文件和资源
+          Copy-Item $BINARY_PATH -Destination $PACKAGE_DIR
+          foreach ($res in $RESOURCES) {
+            if (Test-Path $res) {
+              Copy-Item $res -Destination $PACKAGE_DIR
+            }
+          }
+          # 根据系统类型创建压缩包
+          $ARCHIVE_NAME = "bing-auto-reward-${{ github.ref_name }}-${{ matrix.target }}"
+          Compress-Archive -Path "$PACKAGE_DIR\*" -DestinationPath "${ARCHIVE_NAME}.zip"
+          echo "ASSET_PATH=${ARCHIVE_NAME}.zip" >> $env:GITHUB_ENV
+
+
+      - name: Prepare release assets
         shell: bash
+        if: matrix.os != 'windows-latest'
         run: |
           # 确定源文件路径
           SOURCE_DIR="target/${{ matrix.target }}/release"
