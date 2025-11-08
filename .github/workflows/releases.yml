@@ -1,40 +1,84 @@
-name: 自动发布 Releases
+name: Release
 
 on:
   push:
-    branches: [ "master" ]
-  pull_request:
-    branches: [ "master" ]
-
-env:
-  CARGO_TERM_COLOR: always
+    tags:
+      - "v*.*.*"
 
 jobs:
-  build:
-    name: linux 打包工作
-    runs-on: ubuntu-latest
+  build-and-release:
+    name: Build and Release for ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            binary_name: bing-auto-reward
+            archive_ext: tar.gz
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            binary_name: bing-auto-reward.exe
+            archive_ext: zip
+          - os: macos-latest
+            target: x86_64-apple-darwin
+            binary_name: bing-auto-reward
+            archive_ext: tar.gz
 
     steps:
-      - name: 克隆代码
+      - name: Checkout code
         uses: actions/checkout@v4
+
+      - name: Set up Rust
+        uses: actions-rs/toolchain@v1
         with:
-          ref: master
+          toolchain: stable
+          target: ${{ matrix.target }}
+          override: true
 
-      - name: 编译
-        run: cargo build --release
+      - name: Build binary
+        run: cargo build --release --target ${{ matrix.target }}
+        env:
+          RUST_BACKTRACE: 1
 
-      - name: 获取版本号
-        id: get_version
-        run: echo "VERSION=$(cargo read-manifest | jq -r .version)" >> $GITHUB_ENV
+      - name: Prepare release assets
+        shell: bash
+        run: |
+          # 确定源文件路径
+          SOURCE_DIR="target/${{ matrix.target }}/release"
+          BINARY_PATH="$SOURCE_DIR/${{ matrix.binary_name }}"
 
-      - name: 创建 Release
-        id: create_release
-        uses: softprops/action-gh-release@v2
+          # 确定资源文件和目录
+          RESOURCES=("config.json" "log4rs.yaml")
+          
+          # 创建临时打包目录
+          PACKAGE_DIR="release_package"
+          mkdir -p "$PACKAGE_DIR"
+          
+          # 复制二进制文件和资源
+          cp "$BINARY_PATH" "$PACKAGE_DIR/"
+          for res in "${RESOURCES[@]}"; do
+            if [ -f "$res" ]; then
+              cp "$res" "$PACKAGE_DIR/"
+            fi
+          done
+          
+          # 根据系统类型创建压缩包
+          ARCHIVE_NAME="bing-auto-reward-${{ github.ref_name }}-${{ matrix.target }}"
+          if [ "${{ matrix.archive_ext }}" = "zip" ]; then
+            (cd "$PACKAGE_DIR" && zip -r "../${ARCHIVE_NAME}.zip" .)
+            echo "ASSET_PATH=${ARCHIVE_NAME}.zip" >> $GITHUB_ENV
+          else
+            (cd "$PACKAGE_DIR" && tar -czf "../${ARCHIVE_NAME}.tar.gz" .)
+            echo "ASSET_PATH=${ARCHIVE_NAME}.tar.gz" >> $GITHUB_ENV
+          fi
+
+      - name: Upload Release Asset
+        uses: actions/upload-release-asset@v1
         with:
-          tag_name: "v${{ env.VERSION }}"
-          name: "linux_v${{ env.VERSION }}"
-          draft: false
-          prerelease: false
-          files: |
-            target/release/bing-auto-reward
-            log4rs.yaml
+          upload_url: ${{ github.event.release.upload_url }}
+          asset_path: ${{ env.ASSET_PATH }}
+          asset_name: ${{ env.ASSET_PATH }}
+          asset_content_type: application/octet-stream
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
