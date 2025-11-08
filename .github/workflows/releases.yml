@@ -1,0 +1,40 @@
+name: 自动发布 Releases
+
+on:
+  push:
+    branches: [ "master" ]
+  pull_request:
+    branches: [ "master" ]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: linux 打包工作
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: 克隆代码
+        uses: actions/checkout@v4
+        with:
+          ref: master
+
+      - name: 编译
+        run: cargo build --release
+
+      - name: 获取版本号
+        id: get_version
+        run: echo "VERSION=$(cargo read-manifest | jq -r .version)" >> $GITHUB_ENV
+
+      - name: 创建 Release
+        id: create_release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: "v${{ env.VERSION }}"
+          name: "linux_v${{ env.VERSION }}"
+          draft: false
+          prerelease: false
+          files: |
+            target/release/bing-auto-reward
+            log4rs.yaml
