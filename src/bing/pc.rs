@@ -31,7 +31,7 @@ impl BingBot {
             Some(dir.path().to_path_buf())
         };
         let options = default_options_builder()
-            .path(browser_path.clone().map(|s| PathBuf::from(s)))
+            .path(browser_path.clone().map(PathBuf::from))
             .user_data_dir(user_dir)
             .build()
             .unwrap();
@@ -53,9 +53,11 @@ impl BingBot {
 pub(crate) fn process_account(email: &str, password: &str, browser: &mut Browser) -> Result<()> {
     info!("开始登录Bing账号: {}", email);
     let tab = browser.new_tab()?;
+    tab.set_default_timeout(Duration::from_secs(25));
     (|| {
         if !check_login_status(&tab)? {
             login_bing(email, password, &tab)?;
+            sleep(Duration::from_secs(5));
             if !check_login_status(&tab)? {
                 return Err(anyhow!("登录后检查状态仍然未登录"));
             }
@@ -73,9 +75,9 @@ pub(crate) fn process_account(email: &str, password: &str, browser: &mut Browser
     sleep(Duration::from_secs(5));
 
     info!("开始尝试点击卡片");
-    click_rewards(browser, &tab).inspect_err(|_| {
+    let _ = click_rewards(browser, &tab).inspect_err(|_| {
         shot_when_faild(&tab, "click_rewards", email);
-    })?;
+    });
 
     sleep(Duration::from_secs(5));
 
@@ -105,6 +107,7 @@ fn search(browser: &mut Browser, email: &str, tab: &Tab) -> Result<()> {
                     }
                 }
                 Err(e) => {
+                    shot_when_faild(tab, "mobile_rewards_get_failed", email);
                     warn!("获取账号 {} 积分详情失败: {}", email, e);
                 }
             }
@@ -170,6 +173,19 @@ fn search(browser: &mut Browser, email: &str, tab: &Tab) -> Result<()> {
                 .click()
                 .map_err(|e| anyhow::Error::msg(format!("搜索按钮点击失败：{}", e)))?;
 
+            sleep(Duration::from_secs(rand::random_range(1..4)));
+
+            let search_res = tab.wait_for_element("#b_results")?;
+
+            let all_res = search_res.find_elements("li.b_algo")?;
+
+            let ele = all_res
+                .get(rand::random_range(0..all_res.len()))
+                .ok_or(anyhow!("没有找到搜索结果"))?;
+
+            ele.click()
+                .map_err(|e| anyhow::Error::msg(format!("点击搜索结果失败：{}", e)))?;
+
             sleep(Duration::from_secs(rand::random_range(5..10)));
 
             close_tab(before_tabs, browser)?;
@@ -201,7 +217,7 @@ fn click_rewards(browser: &mut Browser, tab: &Tab) -> Result<()> {
     sleep(Duration::from_secs(2));
     info!("开始寻找可点击卡片");
 
-    tab.wait_for_element_with_custom_timeout(".c-card-content a", Duration::from_secs(10))?;
+    tab.wait_for_element_with_custom_timeout(".c-card-content a", Duration::from_secs(30))?;
 
     let cards = tab
         .find_elements(".c-card-content a")?
@@ -220,7 +236,7 @@ fn click_rewards(browser: &mut Browser, tab: &Tab) -> Result<()> {
             Err(e) => warn!("通过 JS 点击卡片失败：{}", e),
         }
 
-        sleep(Duration::from_secs(3));
+        sleep(Duration::from_secs(5));
         close_tab(before_tabs, browser)?;
     }
 
@@ -278,7 +294,7 @@ fn login_bing(email: &str, password: &str, tab: &Tab) -> Result<()> {
             Err(_e) => {
                 let _ = tab
                     .wait_for_xpath_with_custom_timeout(concat!(
-                        "//span[@role='button' and (text()='其他登录方法' or text()='Use another way to sign in')]",
+                        "//span[@role='button' and (text()='其他登录方法' or text()='Other ways to sign in')]",
                         "|//*[text()='其他登录方法']"
                     ), Duration::from_secs(5)).and_then(|button| {
                         button.click().map(|_| ())
@@ -287,11 +303,11 @@ fn login_bing(email: &str, password: &str, tab: &Tab) -> Result<()> {
                 let button = tab.wait_for_xpath_with_custom_timeout(
                     concat!(
                         "//*[text()='使用密码']",
-                        "|//*[text()='Use password']",
+                        "|//*[text()='Use your password']",
                         "|//button[contains(text(), '使用密码')]",
-                        "|//button[contains(text(), 'Use password')]",
+                        "|//button[contains(text(), 'Use your password')]",
                         "|//a[contains(text(), '使用密码')]",
-                        "|//a[contains(text(), 'Use password')]",
+                        "|//a[contains(text(), 'Use your password')]",
                     ),
                     Duration::from_secs(5),
                 )?;
@@ -402,8 +418,8 @@ fn get_pc_search_process(tab: &Tab) -> Result<(u32, u32)> {
 
     let ele = tab.wait_for_element_with_custom_timeout(
         "#userPointsBreakdown > div > div:nth-child(2) > div > div:nth-child(1) > div > div.pointsDetail > mee-rewards-user-points-details > div > div > div > div > p.pointsDetail.c-subheading-3.ng-binding",
-        Duration::from_secs(15),
-    )?;
+        Duration::from_secs(40),
+    ).map_err(|e| anyhow!(format!("没有找到电脑搜索积分：{}", e)))?;
 
     let text = ele.get_inner_text()?;
 
@@ -460,7 +476,7 @@ fn get_search_words(tab: &Tab) -> Result<Vec<String>> {
         tab.navigate_to("https://s.weibo.com/top/summary")?;
         tab.wait_for_element_with_custom_timeout(
             "#pl_top_realtimehot > table > tbody > tr:nth-child(2) > td.td-02 > a",
-            Duration::from_secs(3),
+            Duration::from_secs(10),
         )?;
 
         let html = tab.get_content()?;

@@ -3,6 +3,7 @@ use std::{mem::ManuallyDrop, path::PathBuf, thread::sleep, time::Duration};
 use headless_chrome::{Browser, LaunchOptionsBuilder, Tab};
 use log::{debug, info, warn};
 use rand::seq::SliceRandom;
+use serde_json::Value;
 
 use crate::bing::{
     BING_URL, BingBot, GAP_RANGE, HEADLESS, SLEEP_RANGE, close_tab, get_today_rewards,
@@ -36,7 +37,7 @@ impl BingBot {
         };
 
         let options = default_options_builder()
-            .path(browser_path.clone().map(|s| PathBuf::from(s)))
+            .path(browser_path.clone().map(PathBuf::from))
             .user_data_dir(user_dir)
             .build()
             .unwrap();
@@ -50,11 +51,13 @@ impl BingBot {
 
 pub(crate) fn process_account(email: &str, password: &str, browser: &mut Browser) -> Result<()> {
     let tab = browser.new_tab()?;
+    tab.set_default_timeout(Duration::from_secs(25));
     info!("开始处理移动端账号: {}", email);
     // 重试三次登录
     (|| {
         if !check_login_status(&tab)? {
             login_bing_mobile(email, password, &tab)?;
+            sleep(Duration::from_secs(5));
             if !check_login_status(&tab)? {
                 return Err(anyhow!("登录后检查状态发现未登录"));
             }
@@ -95,6 +98,7 @@ fn search(tab: &Tab, browser: &mut Browser, email: &str) -> Result<()> {
                     }
                 }
                 Err(e) => {
+                    shot_when_faild(tab, "mobile_rewards_get_failed", email);
                     warn!("获取账号 {} 积分详情失败: {}", email, e);
                 }
             }
@@ -161,6 +165,19 @@ fn search(tab: &Tab, browser: &mut Browser, email: &str) -> Result<()> {
                 .click()
                 .map_err(|e| anyhow::Error::msg(format!("搜索按钮点击失败：{}", e)))?;
 
+            sleep(Duration::from_secs(rand::random_range(1..4)));
+
+            let search_res = tab.wait_for_element("#b_results")?;
+
+            let all_res = search_res.find_elements("li.b_algo")?;
+
+            let ele = all_res
+                .get(rand::random_range(0..all_res.len()))
+                .ok_or(anyhow!("没有找到搜索结果"))?;
+
+            ele.click()
+                .map_err(|e| anyhow::Error::msg(format!("点击搜索结果失败：{}", e)))?;
+
             sleep(Duration::from_secs(rand::random_range(5..10)));
 
             close_tab(before_tabs, browser)?;
@@ -187,19 +204,24 @@ fn get_mobile_search_process(tab: &Tab) -> Result<(u32, u32)> {
     tab.navigate_to("https://rewards.bing.com/status/pointsbreakdown")?;
     tab.wait_until_navigated()?;
 
-    let ele = tab.wait_for_element("#meeGradientBanner > div > div > div > p")?;
+    let ele = tab
+        .wait_for_element_with_custom_timeout(
+            "#meeGradientBanner > div > div > div > p",
+            Duration::from_secs(40),
+        )
+        .map_err(|e| anyhow!(format!("没有找到等级：{}", e)))?;
 
     let text = ele.get_inner_text()?;
     let text = text.trim();
-    if text == "1级" || text == "一级" {
+    if matches!(text, "一级" | "Level 1" | "1级" | "Level One" | "1 级") {
         warn!("当前账号处于一级会员，没有移动端搜索积分");
         return Ok((0, 0));
     }
 
     let ele = tab.wait_for_element_with_custom_timeout(
         "#userPointsBreakdown > div > div:nth-child(2) > div > div:nth-child(2) > div > div.pointsDetail > mee-rewards-user-points-details > div > div > div > div > p.pointsDetail.c-subheading-3.ng-binding",
-        Duration::from_secs(5),
-    )?;
+        Duration::from_secs(40),
+    ).map_err(|e| anyhow!(format!("没有找到移动搜索积分：{}", e)))?;
 
     let text = ele.get_inner_text()?;
 
@@ -220,10 +242,11 @@ fn get_mobile_search_process(tab: &Tab) -> Result<(u32, u32)> {
 }
 
 fn get_search_words(tab: &Tab) -> Result<Vec<String>> {
+    info!("开始获取360热搜");
     if let Ok(hot) = (|| {
         tab.navigate_to("https://ranks.hao.360.com/")?;
         tab.wait_until_navigated()?;
-        tab.wait_for_element("#main > div > div.center-section.svelte-1xaaya4 > ul > li:nth-child(1) > a > div.text.svelte-10xd19r > div.title.svelte-10xd19r")?;
+        tab.wait_for_element_with_custom_timeout("#main > div > div.center-section.svelte-1xaaya4 > ul > li:nth-child(1) > a > div.text.svelte-10xd19r > div.title.svelte-10xd19r", Duration::from_secs(15))?;
         let html = tab.get_content()?;
         let document = scraper::Html::parse_document(&html);
         let selector = scraper::Selector::parse(" #main > div > div.center-section.svelte-1xaaya4 > ul > li > a > div.text.svelte-10xd19r > div.title.svelte-10xd19r ").unwrap();
@@ -244,6 +267,65 @@ fn get_search_words(tab: &Tab) -> Result<Vec<String>> {
     })() {
         return Ok(hot);
     }
+    warn!("获取360热搜失败");
+
+    info!("开始获取zhihu热搜");
+    if let Ok(hot) = (|| {
+        let josn: Value =
+            reqwest::blocking::get("https://uapis.cn/api/v1/misc/hotboard?type=zhihu")?.json()?;
+        let mut hot_words = josn["list"]
+            .as_array()
+            .ok_or(anyhow!(""))?
+            .iter()
+            .map(|e| e["title"].as_str().unwrap().to_string())
+            .take(80)
+            .collect::<Vec<_>>();
+
+        hot_words.shuffle(&mut rand::rng());
+
+        if !hot_words.is_empty() {
+            info!("成功获取到知乎热搜");
+            Ok(hot_words)
+        } else {
+            Err(anyhow!("没有找到热词"))
+        }
+    })() {
+        return Ok(hot);
+    }
+    warn!("获取zhihu热搜失败");
+
+    info!("开始获取微博热搜");
+    if let Ok(hot_words) = (|| {
+        tab.navigate_to("https://s.weibo.com/top/summary")?;
+        tab.wait_for_element_with_custom_timeout(
+            "#pl_top_realtimehot > table > tbody > tr:nth-child(2) > td.td-02 > a",
+            Duration::from_secs(10),
+        )?;
+
+        let html = tab.get_content()?;
+        let document = scraper::Html::parse_document(&html);
+        let selector = scraper::Selector::parse(
+            "#pl_top_realtimehot > table > tbody > tr:nth-child(n) > td.td-02 > a",
+        )
+        .unwrap();
+        let mut hot_words = document
+            .select(&selector)
+            .take(80)
+            .map(|ele| ele.text().collect::<String>())
+            .collect::<Vec<_>>();
+
+        hot_words.shuffle(&mut rand::rng());
+
+        if !hot_words.is_empty() {
+            info!("成功获取到微博热搜");
+            Ok(hot_words)
+        } else {
+            Err(anyhow!("没有找到热词"))
+        }
+    })() {
+        return Ok(hot_words);
+    }
+    warn!("获取微博热搜失败");
 
     info!("返回默认热词");
     Ok([
@@ -328,7 +410,7 @@ fn login_bing_mobile(email: &str, password: &str, tab: &Tab) -> Result<()> {
             Err(_e) => {
                 let _ = tab
                     .wait_for_xpath_with_custom_timeout(concat!(
-                        "//span[@role='button' and (text()='其他登录方法' or text()='Use another way to sign in')]",
+                        "//span[@role='button' and (text()='其他登录方法' or text()='Other ways to sign in')]",
                         "|//*[text()='其他登录方法']"
                     ), Duration::from_secs(5)).and_then(|button| {
                         button.click().map(|_| ())
@@ -337,11 +419,11 @@ fn login_bing_mobile(email: &str, password: &str, tab: &Tab) -> Result<()> {
                 let button = tab.wait_for_xpath_with_custom_timeout(
                     concat!(
                         "//*[text()='使用密码']",
-                        "|//*[text()='Use password']",
+                        "|//*[text()='Use your password']",
                         "|//button[contains(text(), '使用密码')]",
-                        "|//button[contains(text(), 'Use password')]",
+                        "|//button[contains(text(), 'Use your password')]",
                         "|//a[contains(text(), '使用密码')]",
-                        "|//a[contains(text(), 'Use password')]",
+                        "|//a[contains(text(), 'Use your password')]",
                     ),
                     Duration::from_secs(5),
                 )?;
