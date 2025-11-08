@@ -107,3 +107,4 @@ jobs:
         with:
           files: ${{ env.ASSET_PATH }}
           token: ${{ secrets.GHP_TOKEN }}
+          name: latest
