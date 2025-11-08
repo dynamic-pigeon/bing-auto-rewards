@@ -17,15 +17,15 @@ impl BingBot {
         account: &str,
         browser_path: &Option<String>,
     ) -> BingBot {
+        // PC 端同样需要独立的临时目录，避免跨账号串数据
         std::fs::create_dir_all("./tmp").unwrap();
         let temp_dir = None;
 
+        // 根据是否持久化选择用户目录
         let user_dir = if store_local {
             std::fs::create_dir_all("./user-data").unwrap();
-            Some(std::path::PathBuf::from(format!(
-                "./user-data/pc_{}",
-                account
-            )))
+            let dir_name = format!("./user-data/pc_{}", account);
+            Some(std::path::PathBuf::from(dir_name))
         } else {
             let dir = tempfile::TempDir::new_in("./tmp").unwrap();
             Some(dir.path().to_path_buf())
@@ -54,21 +54,24 @@ pub(crate) fn process_account(email: &str, password: &str, browser: &mut Browser
     info!("开始登录Bing账号: {}", email);
     let tab = browser.new_tab()?;
     tab.set_default_timeout(Duration::from_secs(25));
-    (|| {
-        if !check_login_status(&tab)? {
-            login_bing(email, password, &tab)?;
-            sleep(Duration::from_secs(5));
-            if !check_login_status(&tab)? {
-                return Err(anyhow!("登录后检查状态仍然未登录"));
-            }
-        } else {
+    // 封装登录逻辑，便于失败时整体重试
+    let ensure_logged_in = || -> Result<()> {
+        if check_login_status(&tab)? {
             info!("账号 {} 已登录，无需重复登录", email);
+            return Ok(());
+        }
+
+        login_bing(email, password, &tab)?;
+        sleep(Duration::from_secs(5));
+
+        if !check_login_status(&tab)? {
+            return Err(anyhow!("登录后检查状态仍然未登录"));
         }
 
         Ok(())
-    })
-    .retry(3)
-    .inspect_err(|_| {
+    };
+
+    ensure_logged_in.retry(3).inspect_err(|_| {
         shot_when_faild(&tab, "login", email);
     })?;
 
@@ -91,10 +94,13 @@ pub(crate) fn process_account(email: &str, password: &str, browser: &mut Browser
 }
 
 fn search(browser: &mut Browser, email: &str, tab: &Tab) -> Result<()> {
+    // 使用热搜词作为搜索内容，提升积分获取成功率
     let search_words = get_search_words(tab)?;
 
     for (i, word) in search_words.into_iter().enumerate() {
-        if i % 5 == 0 {
+        // 控制积分查询频率，减少 Rewards 页面访问
+        let need_progress_check = i % 5 == 0;
+        if need_progress_check {
             match get_pc_search_process(tab) {
                 Ok((cur_points, max_points)) => {
                     info!(
@@ -112,6 +118,8 @@ fn search(browser: &mut Browser, email: &str, tab: &Tab) -> Result<()> {
                 }
             }
         }
+
+        // 穿插随机等待，模拟真实用户搜索节奏
         let sleep_time = if (i + 1) % 5 == 0 {
             rand::random_range(GAP_RANGE)
         } else {
@@ -125,10 +133,12 @@ fn search(browser: &mut Browser, email: &str, tab: &Tab) -> Result<()> {
             i + 1,
             word
         );
+
         const MAX_SLEEP_TIME: u64 = 60;
         if sleep_time < MAX_SLEEP_TIME {
             sleep(Duration::from_secs(sleep_time));
         } else {
+            // 超长等待分段执行，同时刷新页面以保持会话
             let mut slept = 0;
             while slept < sleep_time {
                 let sleep_chunk = std::cmp::min(MAX_SLEEP_TIME, sleep_time - slept);
@@ -139,7 +149,8 @@ fn search(browser: &mut Browser, email: &str, tab: &Tab) -> Result<()> {
             }
         }
 
-        (|| {
+        // 单次搜索封装成闭包，方便结合 Retryable 使用
+        let run_single_search = || -> Result<()> {
             use anyhow::Error;
             tab.activate()
                 .map_err(|e| Error::msg(format!("activate 失败：{}", e)))?;
@@ -151,11 +162,9 @@ fn search(browser: &mut Browser, email: &str, tab: &Tab) -> Result<()> {
 
             sleep(Duration::from_secs(1));
 
+            let input_xpath = "//input[@name='q']|//*[@id='sb_form_q']";
             let search_input = tab
-                .wait_for_xpath_with_custom_timeout(
-                    "//input[@name='q']|//*[@id='sb_form_q']",
-                    Duration::from_secs(10),
-                )
+                .wait_for_xpath_with_custom_timeout(input_xpath, Duration::from_secs(10))
                 .map_err(|e| anyhow::Error::msg(format!("寻找输入框失败：{}", e)))?;
 
             search_input
@@ -164,10 +173,11 @@ fn search(browser: &mut Browser, email: &str, tab: &Tab) -> Result<()> {
 
             debug!("输入搜索词：{} 成功", &word);
 
+            // 记录当前标签页，用于后续关闭新打开的页面
             let before_tabs = browser.get_tabs().lock().unwrap().clone();
-
+            let search_button_xpath = "//label[@id='search_icon']";
             let search_button = tab
-                .find_element_by_xpath("//label[@id='search_icon']")
+                .find_element_by_xpath(search_button_xpath)
                 .map_err(|e| Error::msg(format!("寻找搜索按钮失败：{}", e)))?;
             search_button
                 .click()
@@ -176,7 +186,6 @@ fn search(browser: &mut Browser, email: &str, tab: &Tab) -> Result<()> {
             sleep(Duration::from_secs(rand::random_range(1..4)));
 
             let search_res = tab.wait_for_element("#b_results")?;
-
             let all_res = search_res.find_elements("li.b_algo")?;
 
             let ele = all_res
@@ -193,16 +202,13 @@ fn search(browser: &mut Browser, email: &str, tab: &Tab) -> Result<()> {
             info!("第 {} 次搜索完成", i + 1);
 
             Ok(())
-        })
-        .retry(3)?;
+        };
+
+        run_single_search.retry(3)?;
 
         match get_today_rewards(tab) {
-            Ok(points) => {
-                info!("账号 {} 今日搜索积分: {}", email, points);
-            }
-            Err(e) => {
-                warn!("获取账号 {} 今日积分失败: {}", email, e);
-            }
+            Ok(points) => info!("账号 {} 今日搜索积分: {}", email, points),
+            Err(e) => warn!("获取账号 {} 今日积分失败: {}", email, e),
         }
     }
 
@@ -217,10 +223,11 @@ fn click_rewards(browser: &mut Browser, tab: &Tab) -> Result<()> {
     sleep(Duration::from_secs(2));
     info!("开始寻找可点击卡片");
 
-    tab.wait_for_element_with_custom_timeout(".c-card-content a", Duration::from_secs(30))?;
+    let card_selector = ".c-card-content a";
+    tab.wait_for_element_with_custom_timeout(card_selector, Duration::from_secs(30))?;
 
     let cards = tab
-        .find_elements(".c-card-content a")?
+        .find_elements(card_selector)?
         .into_iter()
         .filter(|ele| ele.find_element(".mee-icon-AddMedium").is_ok())
         .collect::<Vec<_>>();
@@ -248,67 +255,63 @@ fn login_bing(email: &str, password: &str, tab: &Tab) -> Result<()> {
     tab.navigate_to(BING_URL)?;
     tab.wait_until_navigated()?;
 
-    if let Err(e) = (|| {
+    let click_login = || -> Result<()> {
         tab.reload(false, None)?;
         tab.wait_until_navigated()?;
         sleep(Duration::from_secs(2));
         click_login_button(tab)
-    })
-    .retry(3)
-    {
+    };
+
+    // 登录入口可能变动，重试几次更稳妥
+    if let Err(e) = click_login.retry(3) {
         warn!("点击登录按钮失败: {}", e);
         return Err(e);
     }
 
     info!("登录按钮点击成功，准备输入账号密码");
+    let email_input_xpath = concat!(
+        "//input[@type='email' or @name='loginfmt']",
+        "|input[@id='usernameEntry']",
+    );
     let email_input = tab
-        .wait_for_xpath_with_custom_timeout(
-            concat!(
-                "//input[@type='email' or @name='loginfmt']",
-                "|input[@id='usernameEntry']",
-            ),
-            Duration::from_secs(10),
-        )
+        .wait_for_xpath_with_custom_timeout(email_input_xpath, Duration::from_secs(10))
         .map_err(|e| anyhow::Error::msg(format!("寻找账号输入位置有误：{}", e)))?;
 
     email_input.type_into(email)?;
 
     info!("账号输入成功，准备点击下一步");
-
-    let next_button = tab.find_element_by_xpath(concat!(
-        "//button[@type='submit']",
-        "|//button[text()='下一步']",
-    ))?;
-
+    let next_button_xpath = concat!("//button[@type='submit']", "|//button[text()='下一步']");
+    let next_button = tab.find_element_by_xpath(next_button_xpath)?;
     next_button.click()?;
 
+    // 密码框可能隐藏在不同入口，循环尝试多种路径
     let password_input = loop {
-        match tab.wait_for_xpath_with_custom_timeout(
-            concat!(
-                "//input[@type='password' or @name='passwd']",
-                "|input[@id='passwordInput']",
-            ),
-            Duration::from_secs(5),
-        ) {
+        let password_input_xpath = concat!(
+            "//input[@type='password' or @name='passwd']",
+            "|input[@id='passwordInput']",
+        );
+
+        match tab.wait_for_xpath_with_custom_timeout(password_input_xpath, Duration::from_secs(5)) {
             Ok(input) => break input,
             Err(_e) => {
+                let other_way_xpath = concat!(
+                    "//span[@role='button' and (text()='其他登录方法' or text()='Other ways to sign in')]",
+                    "|//*[text()='其他登录方法']",
+                );
                 let _ = tab
-                    .wait_for_xpath_with_custom_timeout(concat!(
-                        "//span[@role='button' and (text()='其他登录方法' or text()='Other ways to sign in')]",
-                        "|//*[text()='其他登录方法']"
-                    ), Duration::from_secs(5)).and_then(|button| {
-                        button.click().map(|_| ())
-                    });
+                    .wait_for_xpath_with_custom_timeout(other_way_xpath, Duration::from_secs(5))
+                    .and_then(|button| button.click().map(|_| ()));
 
+                let use_password_xpath = concat!(
+                    "//*[text()='使用密码']",
+                    "|//*[text()='Use your password']",
+                    "|//button[contains(text(), '使用密码')]",
+                    "|//button[contains(text(), 'Use your password')]",
+                    "|//a[contains(text(), '使用密码')]",
+                    "|//a[contains(text(), 'Use your password')]",
+                );
                 let button = tab.wait_for_xpath_with_custom_timeout(
-                    concat!(
-                        "//*[text()='使用密码']",
-                        "|//*[text()='Use your password']",
-                        "|//button[contains(text(), '使用密码')]",
-                        "|//button[contains(text(), 'Use your password')]",
-                        "|//a[contains(text(), '使用密码')]",
-                        "|//a[contains(text(), 'Use your password')]",
-                    ),
+                    use_password_xpath,
                     Duration::from_secs(5),
                 )?;
 
@@ -321,28 +324,29 @@ fn login_bing(email: &str, password: &str, tab: &Tab) -> Result<()> {
 
     info!("密码输入成功，准备点击登录");
 
-    let sign_in_button = tab.find_element_by_xpath(concat!(
+    let sign_in_button_xpath = concat!(
         "//button[@type='submit']",
         "|//button[text()='登录']",
         "|//button[text()='Sign in']",
         "|//button[text()='下一步']",
         "|//button[text()='Next']",
-    ))?;
-
+    );
+    let sign_in_button = tab.find_element_by_xpath(sign_in_button_xpath)?;
     sign_in_button.click()?;
 
     info!("登录按钮点击成功");
 
-    if let Ok(_) = tab.wait_for_xpath_with_custom_timeout(
-        "//*[contains(text(), '保持登录状态')]|//[*contains(text(), 'Stay signed in')]",
-        Duration::from_secs(5),
-    ) && let Ok(ok_button) =
-        tab.find_element_by_xpath(concat!("//button[text()='是']", "|//button[text()='Yes']",))
+    let stay_signed_in_xpath =
+        "//*[contains(text(), '保持登录状态')]|//[*contains(text(), 'Stay signed in')]";
+    let confirm_button_xpath = concat!("//button[text()='是']", "|//button[text()='Yes']",);
+
+    if let Ok(_) =
+        tab.wait_for_xpath_with_custom_timeout(stay_signed_in_xpath, Duration::from_secs(5))
     {
-        let _ = ok_button.click();
-    } else if let Ok(ok_button) =
-        tab.find_element_by_xpath(concat!("//button[text()='是']", "|//button[text()='Yes']",))
-    {
+        if let Ok(ok_button) = tab.find_element_by_xpath(confirm_button_xpath) {
+            let _ = ok_button.click();
+        }
+    } else if let Ok(ok_button) = tab.find_element_by_xpath(confirm_button_xpath) {
         let _ = ok_button.click();
     }
 
@@ -371,17 +375,19 @@ fn check_login_status(tab: &Tab) -> Result<bool> {
 }
 
 fn click_login_button(tab: &Tab) -> Result<()> {
-    let login_button =  tab.wait_for_xpath_with_custom_timeout(concat!(
-            "//span[@id='id_s']",
-            "|//*[@id='id_a']",
-            "|//a[@id='id_l']",
-            "|//a[span[text()='登录'] or span[text()='Sign in'] or span[text()='登入']]",
-            "|//a[contains(@aria-label, '登录') or contains(@aria-label, 'Sign in') or contains(@aria-label, '登入')]",
-            "|//a[contains(text(), '登录') or contains(text(), 'Sign in') or contains(text(), '登入')]",
-            "|//button[span[text()='登录'] or span[text()='Sign in'] or span[text()='登入']]",
-            "|//button[contains(@aria-label, '登录') or contains(@aria-label, 'Sign in') or contains(@aria-label, '登入')]",
-            "|//button[contains(text(), '登录') or contains(text(), 'Sign in') or contains(text(), '登入')]",
-        ), Duration::from_secs(10))?;
+    let login_button_selector = concat!(
+        "//span[@id='id_s']",
+        "|//*[@id='id_a']",
+        "|//a[@id='id_l']",
+        "|//a[span[text()='登录'] or span[text()='Sign in'] or span[text()='登入']]",
+        "|//a[contains(@aria-label, '登录') or contains(@aria-label, 'Sign in') or contains(@aria-label, '登入')]",
+        "|//a[contains(text(), '登录') or contains(text(), 'Sign in') or contains(text(), '登入')]",
+        "|//button[span[text()='登录'] or span[text()='Sign in'] or span[text()='登入']]",
+        "|//button[contains(@aria-label, '登录') or contains(@aria-label, 'Sign in') or contains(@aria-label, '登入')]",
+        "|//button[contains(text(), '登录') or contains(text(), 'Sign in') or contains(text(), '登入')]",
+    );
+    let login_button =
+        tab.wait_for_xpath_with_custom_timeout(login_button_selector, Duration::from_secs(10))?;
 
     info!("找到登录按钮，准备点击");
     sleep(Duration::from_secs(2));
@@ -396,7 +402,7 @@ fn default_options_builder() -> LaunchOptionsBuilder<'static> {
         .headless(HEADLESS)
         .enable_gpu(false)
         .window_size(Some((1920, 1080)))
-        .idle_browser_timeout(Duration::from_mins(2))
+        .idle_browser_timeout(Duration::from_secs(120))
         .args(
             [
                 "--disable-dev-shm-usage",
