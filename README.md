@@ -13,23 +13,31 @@
     "accounts": [
         {
             "email": "xxxx@qq.com",
-            "password": "xxx"
+            "password": "xxx",
+            "proxy": "http://proxy.excample.com:prot"
         },
         {
             "email": "xxx@qq.com",
             "password": "xxxx"
         }
     ],
-    // 这是可选的，默认是一个线程
     "max_threads": 2,
-    // 是否把浏览器数据存储在本地，false 的话会存储在 tmp 文件夹，在程序正常退出时会自动清空
     "store_local": false,
-    // 浏览器可执行路径，可选，不填的时候由程序自动寻找
     "browser_path": "google-chrome-stable",
-    // cron 的定时任务格式（不含秒），see <https://crates.io/crates/croner>，不填就默认只执行一次
-    "sechedule": "0 9 * * *"
+    "schedule": "0 9 * * *"
 }
 ```
+
+参数解释：
+
+- accounts: 必填，账号列表
+  - email：必填，账号邮箱
+  - password：必填，密码
+  - proxy：可选，这个账号的代理服务器
+- max_threads：可选，同时进行处理的线程数量，默认 1
+- store_local：可选，是否把浏览器数据保存到本地，true 则保存到 ./user-data 目录下，现在移动端暂时因为技术原因不能保存，默认 false，程序正常退出时会自动删除浏览器数据，保存在 ./tmp 文件夹
+- browser_path：可选，浏览器可执行路径，不填由程序自动寻找
+- schedule：可选，[详细参数介绍](https://crates.io/crates/croner)，不填默认执行一次
 
 ## TODO：
 

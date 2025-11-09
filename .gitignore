@@ -9,9 +9,8 @@ config.json
 
 *.png
 
-tmp.*
 
 failed
-tmp
+tmp*
 
 user-data/

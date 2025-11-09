@@ -1,12 +1,12 @@
 use std::{mem::ManuallyDrop, path::PathBuf, thread::sleep, time::Duration};
 
-use headless_chrome::{Browser, LaunchOptionsBuilder, Tab};
+use headless_chrome::{Browser, Tab};
 use log::{debug, info, warn};
 use rand::seq::SliceRandom;
 
 use crate::bing::{
-    BING_URL, BingBot, GAP_RANGE, HEADLESS, REWARDS_URL, SLEEP_RANGE, close_tab, get_today_rewards,
-    retry::Retryable, shot_when_faild,
+    BING_URL, BingBot, GAP_RANGE, REWARDS_URL, SLEEP_RANGE, close_tab, default_options_builder,
+    get_today_rewards, retry::Retryable, shot_when_faild,
 };
 
 use anyhow::{Result, anyhow};
@@ -16,6 +16,7 @@ impl BingBot {
         store_local: bool,
         account: &str,
         browser_path: &Option<String>,
+        proxy: &Option<String>,
     ) -> BingBot {
         std::fs::create_dir_all("./tmp").unwrap();
         let temp_dir = None;
@@ -33,6 +34,8 @@ impl BingBot {
         let options = default_options_builder()
             .path(browser_path.clone().map(PathBuf::from))
             .user_data_dir(user_dir)
+            .window_size(Some((1920, 1080)))
+            .proxy_server(proxy.as_deref())
             .build()
             .unwrap();
         let browser = Browser::new(options).unwrap();
@@ -43,15 +46,12 @@ impl BingBot {
     }
 }
 
-/// 为什么是 &mut Browser 而不是 &mut BingBot？
-///
-/// 因为目前 BingBot 只有 browser 一个字段，且没有方法需要用到 temp_dir
-///
-/// 为什么是 &mut Browser 而不是 &Browser？
+/// 为什么是 &mut BingBot 而不是 &BingBot
 ///
 /// 其实是借用了 rust 单一所有权的特性，保证同一时间只有一个可变引用在使用 browser
-pub(crate) fn process_account(email: &str, password: &str, browser: &mut Browser) -> Result<()> {
+pub(crate) fn process_account(email: &str, password: &str, browser: &mut BingBot) -> Result<()> {
     info!("开始登录Bing账号: {}", email);
+    let browser = &mut browser.browser;
     let tab = browser.new_tab()?;
     tab.set_default_timeout(Duration::from_secs(25));
     (|| {
@@ -293,6 +293,13 @@ fn login_bing(email: &str, password: &str, tab: &Tab) -> Result<()> {
             Ok(input) => break input,
             Err(_e) => {
                 let _ = tab
+                    .wait_for_xpath_with_custom_timeout(
+                        "//*[text()='暂时跳过']",
+                        Duration::from_secs(5),
+                    )
+                    .and_then(|button| button.click().map(|_| ()));
+
+                let _ = tab
                     .wait_for_xpath_with_custom_timeout(concat!(
                         "//span[@role='button' and (text()='其他登录方法' or text()='Other ways to sign in')]",
                         "|//*[text()='其他登录方法']"
@@ -388,28 +395,6 @@ fn click_login_button(tab: &Tab) -> Result<()> {
     login_button.click()?;
     tab.wait_until_navigated()?;
     Ok(())
-}
-
-fn default_options_builder() -> LaunchOptionsBuilder<'static> {
-    let mut options = LaunchOptionsBuilder::default();
-    options
-        .headless(HEADLESS)
-        .enable_gpu(false)
-        .window_size(Some((1920, 1080)))
-        .idle_browser_timeout(Duration::from_mins(2))
-        .args(
-            [
-                "--disable-dev-shm-usage",
-                "--disable-extensions",
-                "--disable-blink-features=AutomationControlled",
-                "--no-sandbox",
-                "--allow-running-insecure-content",
-            ]
-            .into_iter()
-            .map(std::ffi::OsStr::new)
-            .collect(),
-        );
-    options
 }
 
 fn get_pc_search_process(tab: &Tab) -> Result<(u32, u32)> {

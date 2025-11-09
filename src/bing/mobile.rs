@@ -1,13 +1,13 @@
-use std::{mem::ManuallyDrop, path::PathBuf, thread::sleep, time::Duration};
+use std::{ffi::OsStr, mem::ManuallyDrop, path::PathBuf, thread::sleep, time::Duration};
 
-use headless_chrome::{Browser, LaunchOptionsBuilder, Tab};
+use headless_chrome::{Browser, Tab};
 use log::{debug, info, warn};
 use rand::seq::SliceRandom;
 use serde_json::Value;
 
 use crate::bing::{
-    BING_URL, BingBot, GAP_RANGE, HEADLESS, SLEEP_RANGE, close_tab, get_today_rewards,
-    retry::Retryable, shot_when_faild,
+    BING_URL, BingBot, GAP_RANGE, SLEEP_RANGE, close_tab, default_options_builder,
+    get_today_rewards, retry::Retryable, shot_when_faild,
 };
 
 use anyhow::{Result, anyhow};
@@ -17,6 +17,7 @@ impl BingBot {
         _store_local: bool,
         account: &str,
         browser_path: &Option<String>,
+        proxy: &Option<String>,
     ) -> Self {
         std::fs::create_dir_all("./tmp").unwrap();
         let temp_dir = None;
@@ -39,6 +40,9 @@ impl BingBot {
         let options = default_options_builder()
             .path(browser_path.clone().map(PathBuf::from))
             .user_data_dir(user_dir)
+            .proxy_server(proxy.as_deref())
+            .window_size(Some((770, 1600)))
+            .args(vec![OsStr::new("--user-agent=Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Mobile Safari/537.36")])
             .build()
             .unwrap();
         let browser = Browser::new(options).unwrap();
@@ -49,7 +53,8 @@ impl BingBot {
     }
 }
 
-pub(crate) fn process_account(email: &str, password: &str, browser: &mut Browser) -> Result<()> {
+pub(crate) fn process_account(email: &str, password: &str, browser: &mut BingBot) -> Result<()> {
+    let browser = &mut browser.browser;
     let tab = browser.new_tab()?;
     tab.set_default_timeout(Duration::from_secs(25));
     info!("开始处理移动端账号: {}", email);
@@ -271,9 +276,9 @@ fn get_search_words(tab: &Tab) -> Result<Vec<String>> {
 
     info!("开始获取zhihu热搜");
     if let Ok(hot) = (|| {
-        let josn: Value =
+        let json: Value =
             reqwest::blocking::get("https://uapis.cn/api/v1/misc/hotboard?type=zhihu")?.json()?;
-        let mut hot_words = josn["list"]
+        let mut hot_words = json["list"]
             .as_array()
             .ok_or(anyhow!(""))?
             .iter()
@@ -409,6 +414,13 @@ fn login_bing_mobile(email: &str, password: &str, tab: &Tab) -> Result<()> {
             Ok(input) => break input,
             Err(_e) => {
                 let _ = tab
+                    .wait_for_xpath_with_custom_timeout(
+                        "//*[text()='暂时跳过']",
+                        Duration::from_secs(5),
+                    )
+                    .and_then(|button| button.click().map(|_| ()));
+
+                let _ = tab
                     .wait_for_xpath_with_custom_timeout(concat!(
                         "//span[@role='button' and (text()='其他登录方法' or text()='Other ways to sign in')]",
                         "|//*[text()='其他登录方法']"
@@ -499,27 +511,4 @@ fn click_login_button(tab: &Tab) -> Result<()> {
 
     login_button.click()?;
     Ok(())
-}
-
-fn default_options_builder() -> LaunchOptionsBuilder<'static> {
-    let mut options = LaunchOptionsBuilder::default();
-    options
-        .headless(HEADLESS)
-        .enable_gpu(false)
-        .window_size(Some((770, 1600)))
-        .idle_browser_timeout(Duration::from_mins(2))
-        .args(
-            [
-                "--disable-dev-shm-usage",
-                "--disable-extensions",
-                "--disable-blink-features=AutomationControlled",
-                "--no-sandbox",
-                "--allow-running-insecure-content",
-                "--user-agent=Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Mobile Safari/537.36",
-            ]
-            .into_iter()
-            .map(std::ffi::OsStr::new)
-            .collect(),
-        );
-    options
 }

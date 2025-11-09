@@ -9,7 +9,7 @@ use std::{
 
 use anyhow::Result;
 use chrono::Local;
-use headless_chrome::{Browser, Tab};
+use headless_chrome::{Browser, LaunchOptionsBuilder, Tab};
 use log::{error, info, warn};
 
 use crate::bing::retry::Retryable;
@@ -48,13 +48,14 @@ struct Config {
     max_threads: Option<usize>,
     store_local: Option<bool>,
     browser_path: Option<String>,
-    sechedule: Option<String>,
+    schedule: Option<String>,
 }
 
 #[derive(serde::Deserialize, Clone)]
 struct Account {
     email: String,
     password: String,
+    proxy: Option<String>,
 }
 
 pub(crate) fn process<P: AsRef<Path>>(config_file: P) -> Result<()> {
@@ -62,7 +63,7 @@ pub(crate) fn process<P: AsRef<Path>>(config_file: P) -> Result<()> {
 
     let config: Config = serde_json::from_reader(config_file)?;
 
-    if let Some(schedule) = config.sechedule.as_deref() {
+    if let Some(schedule) = config.schedule.as_deref() {
         let schedule = croner::Cron::from_str(schedule)
             .inspect_err(|e| error!("定时任务格式串解析有误：{}", e))?;
 
@@ -103,10 +104,14 @@ fn process_once(config: &Config) -> Result<()> {
                     info!("==== 第 {} 个线程处理账号 {} ====", i, account.email);
 
                     let _ = (|| {
-                        let mut bot =
-                            BingBot::new_pc_browser(store_local, &account.email, &browser_path);
+                        let mut bot = BingBot::new_pc_browser(
+                            store_local,
+                            &account.email,
+                            &browser_path,
+                            &account.proxy,
+                        );
 
-                        pc::process_account(&account.email, &account.password, &mut bot.browser)?;
+                        pc::process_account(&account.email, &account.password, &mut bot)?;
                         sleep(time::Duration::from_secs(3));
                         Ok(())
                     })
@@ -114,14 +119,14 @@ fn process_once(config: &Config) -> Result<()> {
                     .inspect_err(|e| error!("处理账号 {} 失败: {}", account.email, e));
 
                     let _ = (|| {
-                        let mut bot =
-                            BingBot::new_mobile_browser(store_local, &account.email, &browser_path);
-
-                        mobile::process_account(
+                        let mut bot = BingBot::new_mobile_browser(
+                            store_local,
                             &account.email,
-                            &account.password,
-                            &mut bot.browser,
-                        )?;
+                            &browser_path,
+                            &account.proxy,
+                        );
+
+                        mobile::process_account(&account.email, &account.password, &mut bot)?;
                         sleep(time::Duration::from_secs(3));
                         Ok(())
                     })
@@ -190,4 +195,25 @@ fn close_tab(before_tabs: Vec<Arc<Tab>>, browser: &mut Browser) -> Result<()> {
         }
     }
     Ok(())
+}
+
+fn default_options_builder() -> LaunchOptionsBuilder<'static> {
+    let mut options = LaunchOptionsBuilder::default();
+    options
+        .headless(HEADLESS)
+        .enable_gpu(false)
+        .idle_browser_timeout(Duration::from_mins(2))
+        .args(
+            [
+                "--disable-dev-shm-usage",
+                "--disable-extensions",
+                "--disable-blink-features=AutomationControlled",
+                "--no-sandbox",
+                "--allow-running-insecure-content",
+            ]
+            .into_iter()
+            .map(std::ffi::OsStr::new)
+            .collect(),
+        );
+    options
 }
