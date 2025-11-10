@@ -34,10 +34,12 @@
   - email：必填，账号邮箱
   - password：必填，密码
   - proxy：可选，这个账号的代理服务器
-- max_threads：可选，同时进行处理的线程数量，默认 1
+- max_threads：可选，同时进行积分处理的线程数量，默认 1
 - store_local：可选，是否把浏览器数据保存到本地，true 则保存到 ./user-data 目录下，现在移动端暂时因为技术原因不能保存，默认 false，程序正常退出时会自动删除浏览器数据，保存在 ./tmp 文件夹
 - browser_path：可选，浏览器可执行路径，不填由程序自动寻找
 - schedule：可选，[详细参数介绍](https://crates.io/crates/croner)，不填默认执行一次
+
+本程序启动的时候同时会拉起一个更新热搜的线程，默认两小时执行一次，更新热搜词
 
 ## TODO：
 

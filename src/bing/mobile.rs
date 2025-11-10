@@ -2,8 +2,6 @@ use std::{ffi::OsStr, mem::ManuallyDrop, path::PathBuf, thread::sleep, time::Dur
 
 use headless_chrome::{Browser, Tab};
 use log::{debug, info, warn};
-use rand::seq::SliceRandom;
-use serde_json::Value;
 
 use crate::bing::{
     BING_URL, BingBot, GAP_RANGE, SLEEP_RANGE, close_tab, default_options_builder,
@@ -87,7 +85,7 @@ pub(crate) fn process_account(email: &str, password: &str, browser: &mut BingBot
 }
 
 fn search(tab: &Tab, browser: &mut Browser, email: &str) -> Result<()> {
-    let search_words = get_search_words(tab)?;
+    let search_words = crate::hot_searches::get_hot_words(50);
 
     for (i, word) in search_words.into_iter().enumerate() {
         if i % 5 == 0 {
@@ -244,125 +242,6 @@ fn get_mobile_search_process(tab: &Tab) -> Result<(u32, u32)> {
         .parse()?;
 
     Ok((cur_points, max_points))
-}
-
-fn get_search_words(tab: &Tab) -> Result<Vec<String>> {
-    info!("开始获取360热搜");
-    if let Ok(hot) = (|| {
-        tab.navigate_to("https://ranks.hao.360.com/")?;
-        tab.wait_until_navigated()?;
-        tab.wait_for_element_with_custom_timeout("#main > div > div.center-section.svelte-1xaaya4 > ul > li:nth-child(1) > a > div.text.svelte-10xd19r > div.title.svelte-10xd19r", Duration::from_secs(15))?;
-        let html = tab.get_content()?;
-        let document = scraper::Html::parse_document(&html);
-        let selector = scraper::Selector::parse(" #main > div > div.center-section.svelte-1xaaya4 > ul > li > a > div.text.svelte-10xd19r > div.title.svelte-10xd19r ").unwrap();
-        let mut hot_words = document
-            .select(&selector)
-            .take(80)
-            .map(|ele| ele.text().collect::<String>())
-            .collect::<Vec<_>>();
-
-        hot_words.shuffle(&mut rand::rng());
-
-        if !hot_words.is_empty() {
-            info!("成功获取到搜索热词");
-            Ok(hot_words)
-        } else {
-            Err(anyhow!("没有找到热词"))
-        }
-    })() {
-        return Ok(hot);
-    }
-    warn!("获取360热搜失败");
-
-    info!("开始获取zhihu热搜");
-    if let Ok(hot) = (|| {
-        let json: Value =
-            reqwest::blocking::get("https://uapis.cn/api/v1/misc/hotboard?type=zhihu")?.json()?;
-        let mut hot_words = json["list"]
-            .as_array()
-            .ok_or(anyhow!(""))?
-            .iter()
-            .map(|e| e["title"].as_str().unwrap().to_string())
-            .take(80)
-            .collect::<Vec<_>>();
-
-        hot_words.shuffle(&mut rand::rng());
-
-        if !hot_words.is_empty() {
-            info!("成功获取到知乎热搜");
-            Ok(hot_words)
-        } else {
-            Err(anyhow!("没有找到热词"))
-        }
-    })() {
-        return Ok(hot);
-    }
-    warn!("获取zhihu热搜失败");
-
-    info!("开始获取微博热搜");
-    if let Ok(hot_words) = (|| {
-        tab.navigate_to("https://s.weibo.com/top/summary")?;
-        tab.wait_for_element_with_custom_timeout(
-            "#pl_top_realtimehot > table > tbody > tr:nth-child(2) > td.td-02 > a",
-            Duration::from_secs(10),
-        )?;
-
-        let html = tab.get_content()?;
-        let document = scraper::Html::parse_document(&html);
-        let selector = scraper::Selector::parse(
-            "#pl_top_realtimehot > table > tbody > tr:nth-child(n) > td.td-02 > a",
-        )
-        .unwrap();
-        let mut hot_words = document
-            .select(&selector)
-            .take(80)
-            .map(|ele| ele.text().collect::<String>())
-            .collect::<Vec<_>>();
-
-        hot_words.shuffle(&mut rand::rng());
-
-        if !hot_words.is_empty() {
-            info!("成功获取到微博热搜");
-            Ok(hot_words)
-        } else {
-            Err(anyhow!("没有找到热词"))
-        }
-    })() {
-        return Ok(hot_words);
-    }
-    warn!("获取微博热搜失败");
-
-    info!("返回默认热词");
-    Ok([
-        "python",
-        "bing",
-        "ai",
-        "chatgpt",
-        "微软",
-        "天气",
-        "NBA",
-        "世界杯",
-        "科技新闻",
-        "人工智能",
-        "股票",
-        "电影",
-        "电视剧",
-        "旅游",
-        "健康",
-        "教育",
-        "汽车",
-        "手机",
-        "数码",
-        "美食",
-        "历史",
-        "地理",
-        "音乐",
-        "游戏",
-        "动漫",
-    ]
-    .into_iter()
-    .map(|s| s.to_string())
-    .collect())
 }
 
 fn login_bing_mobile(email: &str, password: &str, tab: &Tab) -> Result<()> {

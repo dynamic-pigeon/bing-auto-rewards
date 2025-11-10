@@ -2,7 +2,6 @@ use std::{mem::ManuallyDrop, path::PathBuf, thread::sleep, time::Duration};
 
 use headless_chrome::{Browser, Tab};
 use log::{debug, info, warn};
-use rand::seq::SliceRandom;
 
 use crate::bing::{
     BING_URL, BingBot, GAP_RANGE, REWARDS_URL, SLEEP_RANGE, close_tab, default_options_builder,
@@ -91,7 +90,7 @@ pub(crate) fn process_account(email: &str, password: &str, browser: &mut BingBot
 }
 
 fn search(browser: &mut Browser, email: &str, tab: &Tab) -> Result<()> {
-    let search_words = get_search_words(tab)?;
+    let search_words = crate::hot_searches::get_hot_words(50);
 
     for (i, word) in search_words.into_iter().enumerate() {
         if i % 5 == 0 {
@@ -212,33 +211,38 @@ fn search(browser: &mut Browser, email: &str, tab: &Tab) -> Result<()> {
 fn click_rewards(browser: &mut Browser, tab: &Tab) -> Result<()> {
     tab.navigate_to(REWARDS_URL)?;
     tab.wait_until_navigated()?;
-    tab.reload(false, None)?;
 
-    sleep(Duration::from_secs(2));
-    info!("开始寻找可点击卡片");
+    (|| {
+        tab.reload(false, None)?;
 
-    tab.wait_for_element_with_custom_timeout(".c-card-content a", Duration::from_secs(30))?;
+        sleep(Duration::from_secs(2));
+        info!("开始寻找可点击卡片");
 
-    let cards = tab
-        .find_elements(".c-card-content a")?
-        .into_iter()
-        .filter(|ele| ele.find_element(".mee-icon-AddMedium").is_ok())
-        .collect::<Vec<_>>();
+        tab.wait_for_element_with_custom_timeout(".c-card-content a", Duration::from_secs(30))?;
 
-    info!("找到 {} 个可点击卡片", cards.len());
+        let cards = tab
+            .find_elements(".c-card-content a")?
+            .into_iter()
+            .filter(|ele| ele.find_element(".mee-icon-AddMedium").is_ok())
+            .collect::<Vec<_>>();
 
-    for card in cards {
-        let before_tabs = browser.get_tabs().lock().unwrap().clone();
+        info!("找到 {} 个可点击卡片", cards.len());
 
-        // 有些页面元素可能被遮挡，直接调用 JS 的 click() 更稳健
-        match card.call_js_fn("function() { this.click(); }", vec![], false) {
-            Ok(_) => info!("通过 JS 点击卡片成功"),
-            Err(e) => warn!("通过 JS 点击卡片失败：{}", e),
+        for card in cards {
+            let before_tabs = browser.get_tabs().lock().unwrap().clone();
+
+            // 有些页面元素可能被遮挡，直接调用 JS 的 click() 更稳健
+            match card.call_js_fn("function() { this.click(); }", vec![], false) {
+                Ok(_) => info!("通过 JS 点击卡片成功"),
+                Err(e) => warn!("通过 JS 点击卡片失败：{}", e),
+            }
+
+            sleep(Duration::from_secs(5));
+            close_tab(before_tabs, browser)?;
         }
-
-        sleep(Duration::from_secs(5));
-        close_tab(before_tabs, browser)?;
-    }
+        Ok(())
+    })
+    .retry(3)?;
 
     info!("卡片点击完成");
     Ok(())
@@ -422,103 +426,4 @@ fn get_pc_search_process(tab: &Tab) -> Result<(u32, u32)> {
         .parse()?;
 
     Ok((cur_points, max_points))
-}
-
-fn get_search_words(tab: &Tab) -> Result<Vec<String>> {
-    info!("开始获取百度搜索热词");
-    if let Ok(hot_words) = (|| {
-        tab.navigate_to("https://top.baidu.com/board?tab=realtime")?;
-        tab.wait_for_element_with_custom_timeout(
-            ".c-single-text-ellipsis",
-            Duration::from_secs(3),
-        )?;
-
-        let html = tab.get_content()?;
-        let document = scraper::Html::parse_document(&html);
-        let selector = scraper::Selector::parse(".c-single-text-ellipsis").unwrap();
-
-        let mut hot_words = document
-            .select(&selector)
-            .take(80)
-            .map(|ele| ele.text().collect::<String>())
-            .collect::<Vec<_>>();
-
-        hot_words.shuffle(&mut rand::rng());
-
-        if !hot_words.is_empty() {
-            info!("成功获取到百度搜索热词");
-            Ok(hot_words)
-        } else {
-            Err(anyhow!("没有找到热词"))
-        }
-    })() {
-        return Ok(hot_words);
-    }
-    warn!("获取百度搜索热词失败");
-
-    info!("开始获取微博热搜");
-    if let Ok(hot_words) = (|| {
-        tab.navigate_to("https://s.weibo.com/top/summary")?;
-        tab.wait_for_element_with_custom_timeout(
-            "#pl_top_realtimehot > table > tbody > tr:nth-child(2) > td.td-02 > a",
-            Duration::from_secs(10),
-        )?;
-
-        let html = tab.get_content()?;
-        let document = scraper::Html::parse_document(&html);
-        let selector = scraper::Selector::parse(
-            "#pl_top_realtimehot > table > tbody > tr:nth-child(n) > td.td-02 > a",
-        )
-        .unwrap();
-        let mut hot_words = document
-            .select(&selector)
-            .take(80)
-            .map(|ele| ele.text().collect::<String>())
-            .collect::<Vec<_>>();
-
-        hot_words.shuffle(&mut rand::rng());
-
-        if !hot_words.is_empty() {
-            info!("成功获取到微博热搜");
-            Ok(hot_words)
-        } else {
-            Err(anyhow!("没有找到热词"))
-        }
-    })() {
-        return Ok(hot_words);
-    }
-    warn!("获取微博热搜失败");
-
-    info!("返回默认热词");
-
-    Ok([
-        "python",
-        "bing",
-        "ai",
-        "chatgpt",
-        "微软",
-        "天气",
-        "NBA",
-        "世界杯",
-        "科技新闻",
-        "人工智能",
-        "股票",
-        "电影",
-        "电视剧",
-        "旅游",
-        "健康",
-        "教育",
-        "汽车",
-        "手机",
-        "数码",
-        "美食",
-        "历史",
-        "地理",
-        "音乐",
-        "游戏",
-        "动漫",
-    ]
-    .into_iter()
-    .map(|s| s.to_string())
-    .collect())
 }
