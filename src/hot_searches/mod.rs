@@ -1,6 +1,7 @@
 use std::sync::{LazyLock, RwLock};
 
 use linkme::distributed_slice;
+use log::info;
 use rand::seq::IndexedRandom;
 
 mod common;
@@ -22,14 +23,16 @@ pub(crate) fn fetch_hot_words() -> anyhow::Result<()> {
     let mut all_hot_words = Vec::new();
     for provider in HOT_WORDS_PROVIDERS {
         match provider() {
-            Ok(mut words) => all_hot_words.append(&mut words),
+            Ok(words) => all_hot_words.extend(words),
             Err(e) => log::error!("获取热词失败: {}", e),
         }
     }
-    all_hot_words.sort();
+
+    all_hot_words.sort_unstable();
     all_hot_words.dedup();
     let mut hot_words_lock = HOT_WORDS.write().unwrap();
     *hot_words_lock = all_hot_words;
+    info!("获取热搜词共 {} 条", hot_words_lock.len());
     Ok(())
 }
 

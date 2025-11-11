@@ -102,36 +102,7 @@ fn process_once(config: &Config) -> Result<()> {
                 info!("==== 第 {} 个线程启动 ====", i);
                 for account in rx {
                     info!("==== 第 {} 个线程处理账号 {} ====", i, account.email);
-
-                    let _ = (|| {
-                        let mut bot = BingBot::new_pc_browser(
-                            store_local,
-                            &account.email,
-                            &browser_path,
-                            &account.proxy,
-                        );
-
-                        pc::process_account(&account.email, &account.password, &mut bot)?;
-                        sleep(time::Duration::from_secs(3));
-                        Ok(())
-                    })
-                    .retry(2)
-                    .inspect_err(|e| error!("处理账号 {} 失败: {}", account.email, e));
-
-                    let _ = (|| {
-                        let mut bot = BingBot::new_mobile_browser(
-                            store_local,
-                            &account.email,
-                            &browser_path,
-                            &account.proxy,
-                        );
-
-                        mobile::process_account(&account.email, &account.password, &mut bot)?;
-                        sleep(time::Duration::from_secs(3));
-                        Ok(())
-                    })
-                    .retry(2)
-                    .inspect_err(|e| error!("处理移动端账号 {} 失败: {}", account.email, e));
+                    process_account(account, &browser_path, store_local);
                 }
 
                 info!("==== 第 {} 个线程结束 ====", i);
@@ -151,6 +122,30 @@ fn process_once(config: &Config) -> Result<()> {
         let _ = handler.join();
     }
     Ok(())
+}
+
+fn process_account(account: Account, browser_path: &Option<String>, store_local: bool) {
+    let _ = (|| {
+        let mut bot =
+            BingBot::new_pc_browser(store_local, &account.email, &browser_path, &account.proxy);
+
+        pc::process_account(&account.email, &account.password, &mut bot)?;
+        sleep(time::Duration::from_secs(3));
+        Ok(())
+    })
+    .retry(2)
+    .inspect_err(|e| error!("处理账号 {} 失败: {}", account.email, e));
+
+    let _ = (|| {
+        let mut bot =
+            BingBot::new_mobile_browser(store_local, &account.email, &browser_path, &account.proxy);
+
+        mobile::process_account(&account.email, &account.password, &mut bot)?;
+        sleep(time::Duration::from_secs(3));
+        Ok(())
+    })
+    .retry(2)
+    .inspect_err(|e| error!("处理移动端账号 {} 失败: {}", account.email, e));
 }
 
 fn get_today_rewards(tab: &Tab) -> Result<String> {
@@ -184,6 +179,7 @@ fn shot_when_faild(tab: &Tab, prefix: &str, account: &str) {
 
 fn close_tab(before_tabs: Vec<Arc<Tab>>, browser: &mut Browser) -> Result<()> {
     let after_tabs = browser.get_tabs().lock().unwrap().clone();
+    // 就两三个 tab，直接遍历关闭
     for tab in after_tabs.iter() {
         if !before_tabs
             .iter()
@@ -202,14 +198,18 @@ fn default_options_builder() -> LaunchOptionsBuilder<'static> {
     options
         .headless(HEADLESS)
         .enable_gpu(false)
-        .idle_browser_timeout(Duration::from_mins(2))
+        .idle_browser_timeout(Duration::from_mins(15))
+        .sandbox(false)
         .args(
             [
                 "--disable-dev-shm-usage",
                 "--disable-extensions",
                 "--disable-blink-features=AutomationControlled",
-                "--no-sandbox",
                 "--allow-running-insecure-content",
+                "--disable-plugins",
+                "--incognito",
+                "--disable-images",
+                "--disable-web-security",
             ]
             .into_iter()
             .map(std::ffi::OsStr::new)

@@ -1,4 +1,4 @@
-use std::{thread::spawn, time::Duration};
+use std::{str::FromStr, thread::spawn, time::Duration};
 
 use chrono::Local;
 use log::{error, info};
@@ -15,10 +15,7 @@ fn main() {
         error!("获取热搜词失败: {}", e);
     });
     spawn(|| {
-        for time in croner::parser::CronParser::builder()
-            .seconds(croner::parser::Seconds::Disallowed)
-            .build()
-            .parse("0 */2 * * *")
+        for time in croner::Cron::from_str("0 */2 * * *")
             .unwrap()
             .iter_after(Local::now())
         {

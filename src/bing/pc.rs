@@ -1,4 +1,4 @@
-use std::{mem::ManuallyDrop, path::PathBuf, thread::sleep, time::Duration};
+use std::{ffi::OsStr, mem::ManuallyDrop, path::PathBuf, thread::sleep, time::Duration};
 
 use headless_chrome::{Browser, Tab};
 use log::{debug, info, warn};
@@ -17,7 +17,6 @@ impl BingBot {
         browser_path: &Option<String>,
         proxy: &Option<String>,
     ) -> BingBot {
-        std::fs::create_dir_all("./tmp").unwrap();
         let temp_dir = None;
 
         let user_dir = if store_local {
@@ -27,6 +26,7 @@ impl BingBot {
                 account
             )))
         } else {
+            std::fs::create_dir_all("./tmp").unwrap();
             let dir = tempfile::TempDir::new_in("./tmp").unwrap();
             Some(dir.path().to_path_buf())
         };
@@ -35,6 +35,7 @@ impl BingBot {
             .user_data_dir(user_dir)
             .window_size(Some((1920, 1080)))
             .proxy_server(proxy.as_deref())
+            .args(vec![OsStr::new("--user-agent='Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/142.0.0.0 Safari/537.36'")])
             .build()
             .unwrap();
         let browser = Browser::new(options).unwrap();
@@ -51,7 +52,15 @@ impl BingBot {
 pub(crate) fn process_account(email: &str, password: &str, browser: &mut BingBot) -> Result<()> {
     info!("开始登录Bing账号: {}", email);
     let browser = &mut browser.browser;
-    let tab = browser.new_tab()?;
+    let tab = {
+        let tabs = browser.get_tabs().lock().unwrap();
+        if !tabs.is_empty() {
+            tabs[0].clone()
+        } else {
+            drop(tabs);
+            browser.new_tab()?
+        }
+    };
     tab.set_default_timeout(Duration::from_secs(25));
     (|| {
         if !check_login_status(&tab)? {
@@ -139,58 +148,8 @@ fn search(browser: &mut Browser, email: &str, tab: &Tab) -> Result<()> {
         }
 
         (|| {
-            use anyhow::Error;
-            tab.activate()
-                .map_err(|e| Error::msg(format!("activate 失败：{}", e)))?;
-            tab.navigate_to(BING_URL)
-                .map_err(|e| Error::msg(format!("前往 BING_URL失败：{}", e)))?;
-            sleep(Duration::from_secs(2));
-            tab.reload(false, None)
-                .map_err(|e| Error::msg(format!("重新加载失败：{}", e)))?;
-
-            sleep(Duration::from_secs(1));
-
-            let search_input = tab
-                .wait_for_xpath_with_custom_timeout(
-                    "//input[@name='q']|//*[@id='sb_form_q']",
-                    Duration::from_secs(10),
-                )
-                .map_err(|e| anyhow::Error::msg(format!("寻找输入框失败：{}", e)))?;
-
-            search_input
-                .type_into(&word)
-                .map_err(|e| Error::msg(format!("输入失败：{}", e)))?;
-
-            debug!("输入搜索词：{} 成功", &word);
-
-            let before_tabs = browser.get_tabs().lock().unwrap().clone();
-
-            let search_button = tab
-                .find_element_by_xpath("//label[@id='search_icon']")
-                .map_err(|e| Error::msg(format!("寻找搜索按钮失败：{}", e)))?;
-            search_button
-                .click()
-                .map_err(|e| anyhow::Error::msg(format!("搜索按钮点击失败：{}", e)))?;
-
-            sleep(Duration::from_secs(rand::random_range(1..4)));
-
-            let search_res = tab.wait_for_element("#b_results")?;
-
-            let all_res = search_res.find_elements("li.b_algo")?;
-
-            let ele = all_res
-                .get(rand::random_range(0..all_res.len()))
-                .ok_or(anyhow!("没有找到搜索结果"))?;
-
-            ele.click()
-                .map_err(|e| anyhow::Error::msg(format!("点击搜索结果失败：{}", e)))?;
-
-            sleep(Duration::from_secs(rand::random_range(5..10)));
-
-            close_tab(before_tabs, browser)?;
-
+            perform_search_and_click(browser, tab, &word)?;
             info!("第 {} 次搜索完成", i + 1);
-
             Ok(())
         })
         .retry(3)?;
@@ -204,6 +163,59 @@ fn search(browser: &mut Browser, email: &str, tab: &Tab) -> Result<()> {
             }
         }
     }
+
+    Ok(())
+}
+
+fn perform_search_and_click(browser: &mut Browser, tab: &Tab, word: &str) -> Result<()> {
+    tab.activate()
+        .map_err(|e| anyhow!(format!("activate 失败：{}", e)))?;
+    tab.navigate_to(BING_URL)
+        .map_err(|e| anyhow!(format!("前往 BING_URL失败：{}", e)))?;
+    sleep(Duration::from_secs(2));
+    tab.reload(false, None)
+        .map_err(|e| anyhow!(format!("重新加载失败：{}", e)))?;
+
+    sleep(Duration::from_secs(1));
+
+    let search_input = tab
+        .wait_for_xpath_with_custom_timeout(
+            "//input[@name='q']|//*[@id='sb_form_q']",
+            Duration::from_secs(10),
+        )
+        .map_err(|e| anyhow!(format!("寻找输入框失败：{}", e)))?;
+
+    search_input
+        .type_into(word)
+        .map_err(|e| anyhow!(format!("输入失败：{}", e)))?;
+
+    debug!("输入搜索词：{} 成功", word);
+
+    let before_tabs = browser.get_tabs().lock().unwrap().clone();
+
+    let search_button = tab
+        .find_element_by_xpath("//label[@id='search_icon']")
+        .map_err(|e| anyhow!(format!("寻找搜索按钮失败：{}", e)))?;
+    search_button
+        .click()
+        .map_err(|e| anyhow!(format!("搜索按钮点击失败：{}", e)))?;
+
+    sleep(Duration::from_secs(rand::random_range(1..4)));
+
+    let search_res = tab.wait_for_element("#b_results")?;
+
+    let all_res = search_res.find_elements("li.b_algo")?;
+
+    let ele = all_res
+        .get(rand::random_range(0..all_res.len()))
+        .ok_or(anyhow!("没有找到搜索结果"))?;
+
+    ele.click()
+        .map_err(|e| anyhow!(format!("点击搜索结果失败：{}", e)))?;
+
+    sleep(Duration::from_secs(rand::random_range(5..10)));
+
+    close_tab(before_tabs, browser)?;
 
     Ok(())
 }
@@ -249,7 +261,10 @@ fn click_rewards(browser: &mut Browser, tab: &Tab) -> Result<()> {
 }
 
 fn login_bing(email: &str, password: &str, tab: &Tab) -> Result<()> {
+    tab.activate()?;
     tab.navigate_to(BING_URL)?;
+    tab.wait_until_navigated()?;
+    tab.reload(true, None)?;
     tab.wait_until_navigated()?;
 
     if let Err(e) = (|| {
@@ -260,6 +275,7 @@ fn login_bing(email: &str, password: &str, tab: &Tab) -> Result<()> {
     })
     .retry(3)
     {
+        debug!("当前页面：{}", tab.get_url());
         warn!("点击登录按钮失败: {}", e);
         return Err(e);
     }

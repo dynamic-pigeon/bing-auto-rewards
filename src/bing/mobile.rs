@@ -17,7 +17,6 @@ impl BingBot {
         browser_path: &Option<String>,
         proxy: &Option<String>,
     ) -> Self {
-        std::fs::create_dir_all("./tmp").unwrap();
         let temp_dir = None;
 
         // mobile 的 cookie 不生效，为什么？
@@ -31,6 +30,7 @@ impl BingBot {
                 account
             )))
         } else {
+            std::fs::create_dir_all("./tmp").unwrap();
             let dir = tempfile::TempDir::new_in("./tmp").unwrap();
             Some(dir.path().to_path_buf())
         };
@@ -40,7 +40,7 @@ impl BingBot {
             .user_data_dir(user_dir)
             .proxy_server(proxy.as_deref())
             .window_size(Some((770, 1600)))
-            .args(vec![OsStr::new("--user-agent=Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Mobile Safari/537.36")])
+            .args(vec![OsStr::new("--user-agent='Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Mobile Safari/537.36'")])
             .build()
             .unwrap();
         let browser = Browser::new(options).unwrap();
@@ -135,58 +135,8 @@ fn search(tab: &Tab, browser: &mut Browser, email: &str) -> Result<()> {
         }
 
         (|| {
-            use anyhow::Error;
-            tab.activate()
-                .map_err(|e| Error::msg(format!("activate 失败：{}", e)))?;
-            tab.navigate_to(BING_URL)
-                .map_err(|e| Error::msg(format!("前往 BING_URL失败：{}", e)))?;
-            sleep(Duration::from_secs(2));
-            tab.reload(false, None)
-                .map_err(|e| Error::msg(format!("重新加载失败：{}", e)))?;
-
-            sleep(Duration::from_secs(1));
-
-            let search_input = tab
-                .wait_for_xpath_with_custom_timeout(
-                    "//input[@name='q']|//*[@id='sb_form_q']",
-                    Duration::from_secs(10),
-                )
-                .map_err(|e| anyhow::Error::msg(format!("寻找输入框失败：{}", e)))?;
-
-            search_input
-                .type_into(&word)
-                .map_err(|e| Error::msg(format!("输入失败：{}", e)))?;
-
-            debug!("输入搜索词：{} 成功", &word);
-
-            let before_tabs = browser.get_tabs().lock().unwrap().clone();
-
-            let search_button = tab
-                .find_element_by_xpath("//label[@id='search_icon']")
-                .map_err(|e| Error::msg(format!("寻找搜索按钮失败：{}", e)))?;
-            search_button
-                .click()
-                .map_err(|e| anyhow::Error::msg(format!("搜索按钮点击失败：{}", e)))?;
-
-            sleep(Duration::from_secs(rand::random_range(1..4)));
-
-            let search_res = tab.wait_for_element("#b_results")?;
-
-            let all_res = search_res.find_elements("li.b_algo")?;
-
-            let ele = all_res
-                .get(rand::random_range(0..all_res.len()))
-                .ok_or(anyhow!("没有找到搜索结果"))?;
-
-            ele.click()
-                .map_err(|e| anyhow::Error::msg(format!("点击搜索结果失败：{}", e)))?;
-
-            sleep(Duration::from_secs(rand::random_range(5..10)));
-
-            close_tab(before_tabs, browser)?;
-
+            perform_search_and_click(browser, tab, &word)?;
             info!("第 {} 次搜索完成", i + 1);
-
             Ok(())
         })
         .retry(3)?;
@@ -200,6 +150,60 @@ fn search(tab: &Tab, browser: &mut Browser, email: &str) -> Result<()> {
             }
         }
     }
+    Ok(())
+}
+
+// 虽然和 pc 的一模一样，但是考虑到以后可能会有差异，还是分开写了
+fn perform_search_and_click(browser: &mut Browser, tab: &Tab, word: &str) -> Result<()> {
+    tab.activate()
+        .map_err(|e| anyhow!(format!("activate 失败：{}", e)))?;
+    tab.navigate_to(BING_URL)
+        .map_err(|e| anyhow!(format!("前往 BING_URL失败：{}", e)))?;
+    sleep(Duration::from_secs(2));
+    tab.reload(false, None)
+        .map_err(|e| anyhow!(format!("重新加载失败：{}", e)))?;
+
+    sleep(Duration::from_secs(1));
+
+    let search_input = tab
+        .wait_for_xpath_with_custom_timeout(
+            "//input[@name='q']|//*[@id='sb_form_q']",
+            Duration::from_secs(10),
+        )
+        .map_err(|e| anyhow!(format!("寻找输入框失败：{}", e)))?;
+
+    search_input
+        .type_into(word)
+        .map_err(|e| anyhow!(format!("输入失败：{}", e)))?;
+
+    debug!("输入搜索词：{} 成功", word);
+
+    let before_tabs = browser.get_tabs().lock().unwrap().clone();
+
+    let search_button = tab
+        .find_element_by_xpath("//label[@id='search_icon']")
+        .map_err(|e| anyhow!(format!("寻找搜索按钮失败：{}", e)))?;
+    search_button
+        .click()
+        .map_err(|e| anyhow!(format!("搜索按钮点击失败：{}", e)))?;
+
+    sleep(Duration::from_secs(rand::random_range(1..4)));
+
+    let search_res = tab.wait_for_element("#b_results")?;
+
+    let all_res = search_res.find_elements("li.b_algo")?;
+
+    let ele = all_res
+        .get(rand::random_range(0..all_res.len()))
+        .ok_or(anyhow!("没有找到搜索结果"))?;
+
+    ele.click()
+        .map_err(|e| anyhow!(format!("点击搜索结果失败：{}", e)))?;
+
+    sleep(Duration::from_secs(rand::random_range(5..10)));
+
+    close_tab(before_tabs, browser)?;
+
     Ok(())
 }
 

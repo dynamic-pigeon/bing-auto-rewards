@@ -217,7 +217,66 @@ fn get_blibli_tiba_hot_words() -> Result<Vec<String>> {
     }
 }
 
+#[distributed_slice(HOT_WORDS_PROVIDERS)]
+fn get_aiqiyi_hot_words() -> Result<Vec<String>> {
+    let client = reqwest::blocking::ClientBuilder::new()
+        .timeout(Duration::from_secs(5))
+        .build()?;
+    let resp = client
+        .get("https://mesh.if.iqiyi.com/portal/pcw/rankList/comSecRankList?category_id=-1")
+        .send()?;
+
+    let resp: Value = resp.json()?;
+
+    if let Value::Object(mut resp) = resp
+        && let Some(Value::Object(mut data)) = resp.remove("data")
+        && let Some(Value::Array(list)) = data.remove("items")
+    {
+        let hot_words = list
+            .into_iter()
+            .filter_map(|item| {
+                if let Value::Object(mut item) = item
+                    && let Some(Value::Array(contents)) = item.remove("contents")
+                {
+                    let hot_words = contents
+                        .into_iter()
+                        .filter_map(|c| {
+                            if let Value::Object(mut c) = c
+                                && let Some(Value::String(title)) = c.remove("title")
+                            {
+                                Some(title)
+                            } else {
+                                None
+                            }
+                        })
+                        .collect::<Vec<_>>();
+                    Some(hot_words)
+                } else {
+                    None
+                }
+            })
+            .flatten()
+            .collect::<Vec<_>>();
+        if hot_words.is_empty() {
+            return Err(anyhow::anyhow!("未获取到爱奇艺热搜数据"));
+        }
+        Ok(hot_words)
+    } else {
+        Err(anyhow::anyhow!("爱奇艺热搜接口返回数据格式异常"))
+    }
+}
+
 mod test {
+    #[test]
+    fn test_aiqiyi_hot_words() {
+        let hot_words = super::get_aiqiyi_hot_words().unwrap();
+        assert!(!hot_words.is_empty());
+        println!("爱奇艺热搜词数量: {}", hot_words.len());
+        for word in hot_words {
+            println!("{}", word);
+        }
+    }
+
     #[test]
     fn test_blili_tiba_hot_words() {
         let hot_words = super::get_blibli_tiba_hot_words().unwrap();

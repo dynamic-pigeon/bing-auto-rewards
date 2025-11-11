@@ -68,7 +68,6 @@ jobs:
           Compress-Archive -Path "$PACKAGE_DIR\*" -DestinationPath "${ARCHIVE_NAME}.zip"
           echo "ASSET_PATH=${ARCHIVE_NAME}.zip" >> $env:GITHUB_ENV
 
-
       - name: Prepare release assets
         shell: bash
         if: matrix.os != 'windows-latest'
@@ -79,11 +78,11 @@ jobs:
 
           # 确定资源文件和目录
           RESOURCES=("config.json" "log4rs.yaml")
-          
+
           # 创建临时打包目录
           PACKAGE_DIR="release_package"
           mkdir -p "$PACKAGE_DIR"
-          
+
           # 复制二进制文件和资源
           cp "$BINARY_PATH" "$PACKAGE_DIR/"
           for res in "${RESOURCES[@]}"; do
@@ -91,7 +90,7 @@ jobs:
               cp "$res" "$PACKAGE_DIR/"
             fi
           done
-          
+
           # 根据系统类型创建压缩包
           ARCHIVE_NAME="bing-auto-reward-${{ github.ref_name }}-${{ matrix.target }}"
           if [ "${{ matrix.archive_ext }}" = "zip" ]; then
