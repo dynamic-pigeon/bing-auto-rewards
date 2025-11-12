@@ -21,8 +21,9 @@ mod retry;
 const HEADLESS: bool = true;
 const BING_URL: &str = "https://www.bing.com/";
 const REWARDS_URL: &str = "https://rewards.bing.com/";
-const SLEEP_RANGE: std::ops::Range<u64> = 30..70;
-const GAP_RANGE: std::ops::Range<u64> = 600..1000;
+const SLEEP_RANGE: std::ops::Range<u64> = 30..80;
+const GAP_RANGE: std::ops::Range<u64> = 600..1200;
+const GAP_NUM: u32 = 4;
 
 /// 需要保证 temp_dir 的生命周期长于 browser
 pub(crate) struct BingBot {

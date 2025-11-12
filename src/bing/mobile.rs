@@ -3,9 +3,12 @@ use std::{ffi::OsStr, mem::ManuallyDrop, path::PathBuf, thread::sleep, time::Dur
 use headless_chrome::{Browser, Tab};
 use log::{debug, info, warn};
 
-use crate::bing::{
-    BING_URL, BingBot, GAP_RANGE, SLEEP_RANGE, close_tab, default_options_builder,
-    get_today_rewards, retry::Retryable, shot_when_faild,
+use crate::{
+    bing::{
+        BING_URL, BingBot, GAP_NUM, GAP_RANGE, SLEEP_RANGE, close_tab, default_options_builder,
+        retry::Retryable, shot_when_faild,
+    },
+    random::ExpectedNTrigger,
 };
 
 use anyhow::{Result, anyhow};
@@ -87,8 +90,9 @@ pub(crate) fn process_account(email: &str, password: &str, browser: &mut BingBot
 fn search(tab: &Tab, browser: &mut Browser, email: &str) -> Result<()> {
     let search_words = crate::hot_searches::get_hot_words(50);
 
+    let mut tigger = ExpectedNTrigger::new(GAP_NUM);
     for (i, word) in search_words.into_iter().enumerate() {
-        if i % 5 == 0 {
+        if tigger.next() {
             match get_mobile_search_process(tab) {
                 Ok((cur_points, max_points)) => {
                     info!(
@@ -140,15 +144,6 @@ fn search(tab: &Tab, browser: &mut Browser, email: &str) -> Result<()> {
             Ok(())
         })
         .retry(3)?;
-
-        match get_today_rewards(tab) {
-            Ok(points) => {
-                info!("账号 {} 今日搜索积分: {}", email, points);
-            }
-            Err(e) => {
-                warn!("获取账号 {} 今日积分失败: {}", email, e);
-            }
-        }
     }
     Ok(())
 }

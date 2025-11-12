@@ -266,6 +266,7 @@ fn get_aiqiyi_hot_words() -> Result<Vec<String>> {
     }
 }
 
+#[cfg(test)]
 mod test {
     #[test]
     fn test_aiqiyi_hot_words() {

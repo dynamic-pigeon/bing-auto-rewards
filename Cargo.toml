@@ -1,6 +1,6 @@
 [package]
 name = "bing-auto-reward"
-version = "0.1.2"
+version = "0.1.4"
 edition = "2024"
 authors = ["dynamic-pigeon <3040313336@qq.com>"]
 license = "MIT"
@@ -20,3 +20,6 @@ crossbeam = "0.8.4"
 croner = "3.0.1"
 chrono = "0.4"
 linkme = "0.3"
+
+[dev-dependencies]
+rayon = "1.11"
