@@ -5,8 +5,8 @@ use log::{debug, info, warn};
 
 use crate::{
     bing::{
-        BING_URL, BingBot, GAP_NUM, GAP_RANGE, SLEEP_RANGE, close_tab, default_options_builder,
-        retry::Retryable, shot_when_faild,
+        Account, BING_URL, BingBot, GAP_NUM, GAP_RANGE, SLEEP_RANGE, close_tab,
+        default_options_builder, retry::Retryable, shot_when_faild,
     },
     random::ExpectedNTrigger,
 };
@@ -15,16 +15,12 @@ use anyhow::{Result, anyhow};
 
 impl BingBot {
     pub(crate) fn new_mobile_browser(
-        _store_local: bool,
+        store_local: bool,
         account: &str,
         browser_path: &Option<String>,
         proxy: &Option<String>,
     ) -> Self {
         let temp_dir = None;
-
-        // mobile 的 cookie 不生效，为什么？
-        // 总之先不存储了
-        let store_local = false;
 
         let user_dir = if store_local {
             std::fs::create_dir_all("./user-data").unwrap();
@@ -54,33 +50,40 @@ impl BingBot {
     }
 }
 
-pub(crate) fn process_account(email: &str, password: &str, browser: &mut BingBot) -> Result<()> {
-    let browser = &mut browser.browser;
+pub(crate) fn process_account(
+    Account {
+        email,
+        password,
+        proxy,
+    }: &Account,
+    browser_path: &Option<String>,
+    store_local: bool,
+) -> Result<()> {
+    let mut browser_bot = BingBot::new_mobile_browser(store_local, email, browser_path, proxy);
+    info!("开始处理移动端账号: {}", email);
+
+    let browser = &mut browser_bot.browser;
     let tab = browser.new_tab()?;
     tab.set_default_timeout(Duration::from_secs(25));
-    info!("开始处理移动端账号: {}", email);
-    // 重试三次登录
     (|| {
-        if !check_login_status(&tab)? {
+        let logged_in = check_login_status(&tab)?;
+        if !logged_in {
             login_bing_mobile(email, password, &tab)?;
-            sleep(Duration::from_secs(5));
-            if !check_login_status(&tab)? {
-                return Err(anyhow!("登录后检查状态发现未登录"));
-            }
         } else {
-            info!("账号 {} 已登录，无需重复登录", email);
+            info!("账号 {} 已登录，跳过登录步骤", email);
         }
-
         Ok(())
     })
     .retry(3)
-    .inspect_err(|_| {
-        shot_when_faild(&tab, "mobile_login", email);
+    .inspect_err(|e| {
+        shot_when_faild(&tab, "mobile_login_failed", email);
+        warn!("账号 {} 登录失败: {}", email, e);
     })?;
+
+    info!("账号 {} 登录成功，开始搜索任务", email);
 
     sleep(Duration::from_secs(5));
 
-    info!("账号 {} 登录成功，开始搜索任务", email);
     search(&tab, browser, email).inspect_err(|_| {
         shot_when_faild(&tab, "mobile_search", email);
     })?;
@@ -92,7 +95,7 @@ fn search(tab: &Tab, browser: &mut Browser, email: &str) -> Result<()> {
 
     let mut tigger = ExpectedNTrigger::new(GAP_NUM);
     for (i, word) in search_words.into_iter().enumerate() {
-        if tigger.next() {
+        let sleep_time = if tigger.next() {
             match get_mobile_search_process(tab) {
                 Ok((cur_points, max_points)) => {
                     info!(
@@ -109,9 +112,6 @@ fn search(tab: &Tab, browser: &mut Browser, email: &str) -> Result<()> {
                     warn!("获取账号 {} 积分详情失败: {}", email, e);
                 }
             }
-        }
-
-        let sleep_time = if (i + 1) % 5 == 0 {
             rand::random_range(GAP_RANGE)
         } else {
             rand::random_range(SLEEP_RANGE)
@@ -176,7 +176,7 @@ fn perform_search_and_click(browser: &mut Browser, tab: &Tab, word: &str) -> Res
     let before_tabs = browser.get_tabs().lock().unwrap().clone();
 
     let search_button = tab
-        .find_element_by_xpath("//label[@id='search_icon']")
+        .find_element_by_xpath("//label[@id='search_icon']|//*[@id='sb_form']/label/svg")
         .map_err(|e| anyhow!(format!("寻找搜索按钮失败：{}", e)))?;
     search_button
         .click()

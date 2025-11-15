@@ -253,7 +253,7 @@ fn click_rewards(browser: &mut Browser, tab: &Tab) -> Result<()> {
     Ok(())
 }
 
-fn login_bing(email: &str, password: &str, tab: &Tab) -> Result<()> {
+pub(super) fn login_bing(email: &str, password: &str, tab: &Tab) -> Result<()> {
     tab.activate()?;
     tab.navigate_to(BING_URL)?;
     tab.wait_until_navigated()?;
@@ -370,13 +370,13 @@ fn login_bing(email: &str, password: &str, tab: &Tab) -> Result<()> {
     Ok(())
 }
 
-fn check_login_status(tab: &Tab) -> Result<bool> {
+pub(super) fn check_login_status(tab: &Tab) -> Result<bool> {
     tab.navigate_to(BING_URL)?;
     tab.wait_until_navigated()?;
     tab.reload(false, None)?;
     sleep(Duration::from_secs(2));
 
-    match tab.wait_for_element_with_custom_timeout("#id_s", Duration::from_secs(3)) {
+    match tab.wait_for_element_with_custom_timeout("#id_s", Duration::from_secs(25)) {
         Ok(ele) => {
             let status = ele.get_attribute_value("aria-hidden")?;
             match status.as_deref() {
@@ -386,7 +386,9 @@ fn check_login_status(tab: &Tab) -> Result<bool> {
                 _ => Err(anyhow!("未知状态")),
             }
         }
-        Err(_) => Ok(false),
+        Err(_) => {
+            anyhow::bail!("没有找到登录状态元素");
+        }
     }
 }
 
