@@ -1,4 +1,4 @@
-use std::{ffi::OsStr, mem::ManuallyDrop, path::PathBuf, thread::sleep, time::Duration};
+use std::{ffi::OsStr, mem::ManuallyDrop, path::PathBuf, sync::Arc, thread::sleep, time::Duration};
 
 use headless_chrome::{Browser, Tab};
 use log::{debug, info, warn};
@@ -46,7 +46,39 @@ impl BingBot {
         BingBot {
             browser: ManuallyDrop::new(browser),
             temp_dir,
+            store_local,
+            account: account.to_string(),
+            browser_path: browser_path.clone(),
+            proxy: proxy.clone(),
         }
+    }
+
+    pub(crate) fn restart_mobile_browser(&mut self) -> Result<()> {
+        unsafe {
+            ManuallyDrop::drop(&mut self.browser);
+        }
+        let user_dir = if self.store_local {
+            std::fs::create_dir_all("./user-data").unwrap();
+            Some(std::path::PathBuf::from(format!(
+                "./user-data/pc_{}",
+                self.account
+            )))
+        } else {
+            Some(self.temp_dir.as_ref().unwrap().path().to_path_buf())
+        };
+        let options = default_options_builder()
+            .path(self.browser_path.clone().map(PathBuf::from))
+            .user_data_dir(user_dir)
+            .proxy_server(self.proxy.as_deref())
+            .window_size(Some((770, 1600)))
+            .args(vec![OsStr::new("--user-agent='Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Mobile Safari/537.36'")])
+            .build()
+            .unwrap();
+        let browser = Browser::new(options).unwrap();
+
+        self.browser = ManuallyDrop::new(browser);
+        debug!("浏览器重启完成");
+        Ok(())
     }
 }
 
@@ -63,7 +95,7 @@ pub(crate) fn process_account(
     info!("开始处理移动端账号: {}", email);
 
     let browser = &mut browser_bot.browser;
-    let tab = browser.new_tab()?;
+    let mut tab = get_one_tab(browser)?;
     tab.set_default_timeout(Duration::from_secs(25));
     (|| {
         let logged_in = check_login_status(&tab)?;
@@ -84,13 +116,26 @@ pub(crate) fn process_account(
 
     sleep(Duration::from_secs(5));
 
-    search(&tab, browser, email).inspect_err(|_| {
+    search(&mut tab, &mut browser_bot, email).inspect_err(|_| {
         shot_when_faild(&tab, "mobile_search", email);
     })?;
     Ok(())
 }
 
-fn search(tab: &Tab, browser: &mut Browser, email: &str) -> Result<()> {
+fn get_one_tab(browser: &mut Browser) -> Result<Arc<Tab>> {
+    let tabs = browser.get_tabs().lock().unwrap();
+    if !tabs.is_empty() {
+        tabs[0].set_default_timeout(Duration::from_secs(25));
+        Ok(tabs[0].clone())
+    } else {
+        drop(tabs);
+        let tab = browser.new_tab()?;
+        tab.set_default_timeout(Duration::from_secs(25));
+        Ok(tab)
+    }
+}
+
+fn search(tab: &mut Arc<Tab>, browser_bot: &mut BingBot, email: &str) -> Result<()> {
     let search_words = crate::hot_searches::get_hot_words(50);
 
     let mut tigger = ExpectedNTrigger::new(GAP_NUM);
@@ -124,7 +169,7 @@ fn search(tab: &Tab, browser: &mut Browser, email: &str) -> Result<()> {
             i + 1,
             word
         );
-        const MAX_SLEEP_TIME: u64 = 60;
+        const MAX_SLEEP_TIME: u64 = 30;
         if sleep_time < MAX_SLEEP_TIME {
             sleep(Duration::from_secs(sleep_time));
         } else {
@@ -139,7 +184,13 @@ fn search(tab: &Tab, browser: &mut Browser, email: &str) -> Result<()> {
         }
 
         (|| {
-            perform_search_and_click(browser, tab, &word)?;
+            perform_search_and_click(&mut browser_bot.browser, tab, &word).inspect_err(|_| {
+                if let Ok(_) = browser_bot.restart_mobile_browser()
+                    && let Ok(new_tab) = get_one_tab(&mut browser_bot.browser)
+                {
+                    *tab = new_tab;
+                }
+            })?;
             info!("第 {} 次搜索完成", i + 1);
             Ok(())
         })

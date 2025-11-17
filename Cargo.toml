@@ -23,3 +23,6 @@ linkme = "0.3"
 
 [dev-dependencies]
 rayon = "1.11"
+
+[features]
+debug = []

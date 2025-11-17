@@ -37,3 +37,7 @@ loggers:
       - file
       - stdout
     additive: false
+  selectors:
+    level: info
+  html5ever:
+    level: info

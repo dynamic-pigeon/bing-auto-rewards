@@ -1,4 +1,4 @@
-use std::{ffi::OsStr, mem::ManuallyDrop, path::PathBuf, thread::sleep, time::Duration};
+use std::{ffi::OsStr, mem::ManuallyDrop, path::PathBuf, sync::Arc, thread::sleep, time::Duration};
 
 use headless_chrome::{Browser, Tab};
 use log::{debug, info, warn};
@@ -34,7 +34,7 @@ impl BingBot {
             Some(dir.path().to_path_buf())
         };
         let options = default_options_builder()
-            .path(browser_path.clone().map(PathBuf::from))
+            .path(browser_path.as_deref().map(PathBuf::from))
             .user_data_dir(user_dir)
             .window_size(Some((1920, 1080)))
             .proxy_server(proxy.as_deref())
@@ -45,25 +45,53 @@ impl BingBot {
         BingBot {
             browser: ManuallyDrop::new(browser),
             temp_dir,
+            account: account.to_string(),
+            store_local,
+            browser_path: browser_path.clone(),
+            proxy: proxy.clone(),
         }
+    }
+
+    pub(crate) fn restart_pc_browser(&mut self) -> Result<()> {
+        unsafe {
+            ManuallyDrop::drop(&mut self.browser);
+        }
+        let user_dir = if self.store_local {
+            std::fs::create_dir_all("./user-data").unwrap();
+            Some(std::path::PathBuf::from(format!(
+                "./user-data/pc_{}",
+                self.account
+            )))
+        } else {
+            Some(self.temp_dir.as_ref().unwrap().path().to_path_buf())
+        };
+        let options = default_options_builder()
+            .path(self.browser_path.as_deref().map(PathBuf::from))
+            .user_data_dir(user_dir)
+            .window_size(Some((1920, 1080)))
+            .proxy_server(self.proxy.as_deref())
+            .args(vec![OsStr::new("--user-agent='Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/142.0.0.0 Safari/537.36'")])
+            .build()
+            .unwrap();
+        let browser = Browser::new(options)?;
+
+        self.browser = ManuallyDrop::new(browser);
+        debug!("浏览器重启完成");
+        Ok(())
     }
 }
 
 /// 为什么是 &mut BingBot 而不是 &BingBot
 ///
 /// 其实是借用了 rust 单一所有权的特性，保证同一时间只有一个可变引用在使用 browser
-pub(crate) fn process_account(email: &str, password: &str, browser: &mut BingBot) -> Result<()> {
+pub(crate) fn process_account(
+    email: &str,
+    password: &str,
+    browser_bot: &mut BingBot,
+) -> Result<()> {
     info!("开始登录Bing账号: {}", email);
-    let browser = &mut browser.browser;
-    let tab = {
-        let tabs = browser.get_tabs().lock().unwrap();
-        if !tabs.is_empty() {
-            tabs[0].clone()
-        } else {
-            drop(tabs);
-            browser.new_tab()?
-        }
-    };
+    let browser = &mut browser_bot.browser;
+    let mut tab = get_one_tab(browser)?;
     tab.set_default_timeout(Duration::from_secs(25));
     (|| {
         if !check_login_status(&tab)? {
@@ -93,7 +121,7 @@ pub(crate) fn process_account(email: &str, password: &str, browser: &mut BingBot
     sleep(Duration::from_secs(5));
 
     info!("开始进行搜索任务");
-    search(browser, email, &tab).inspect_err(|_| {
+    search(browser_bot, email, &mut tab).inspect_err(|_| {
         shot_when_faild(&tab, "search", email);
     })?;
 
@@ -101,7 +129,20 @@ pub(crate) fn process_account(email: &str, password: &str, browser: &mut BingBot
     Ok(())
 }
 
-fn search(browser: &mut Browser, email: &str, tab: &Tab) -> Result<()> {
+fn get_one_tab(browser: &mut Browser) -> Result<Arc<Tab>> {
+    let tabs = browser.get_tabs().lock().unwrap();
+    if !tabs.is_empty() {
+        tabs[0].set_default_timeout(Duration::from_secs(25));
+        Ok(tabs[0].clone())
+    } else {
+        drop(tabs);
+        let tab = browser.new_tab()?;
+        tab.set_default_timeout(Duration::from_secs(25));
+        Ok(tab)
+    }
+}
+
+fn search(browser_bot: &mut BingBot, email: &str, tab: &mut Arc<Tab>) -> Result<()> {
     let search_words = crate::hot_searches::get_hot_words(50);
 
     let mut trigger = ExpectedNTrigger::new(GAP_NUM);
@@ -119,7 +160,7 @@ fn search(browser: &mut Browser, email: &str, tab: &Tab) -> Result<()> {
                     }
                 }
                 Err(e) => {
-                    shot_when_faild(tab, "mobile_rewards_get_failed", email);
+                    shot_when_faild(tab, "rewards_get_failed", email);
                     warn!("获取账号 {} 积分详情失败: {}", email, e);
                 }
             }
@@ -135,7 +176,7 @@ fn search(browser: &mut Browser, email: &str, tab: &Tab) -> Result<()> {
             i + 1,
             word
         );
-        const MAX_SLEEP_TIME: u64 = 60;
+        const MAX_SLEEP_TIME: u64 = 30;
         if sleep_time < MAX_SLEEP_TIME {
             sleep(Duration::from_secs(sleep_time));
         } else {
@@ -150,7 +191,13 @@ fn search(browser: &mut Browser, email: &str, tab: &Tab) -> Result<()> {
         }
 
         (|| {
-            perform_search_and_click(browser, tab, &word)?;
+            perform_search_and_click(&mut browser_bot.browser, tab, &word).inspect_err(|_| {
+                if let Ok(_) = browser_bot.restart_pc_browser()
+                    && let Ok(new_tab) = get_one_tab(&mut browser_bot.browser)
+                {
+                    *tab = new_tab;
+                }
+            })?;
             info!("第 {} 次搜索完成", i + 1);
             Ok(())
         })
@@ -224,6 +271,7 @@ fn click_rewards(browser: &mut Browser, tab: &Tab) -> Result<()> {
         info!("开始寻找可点击卡片");
 
         tab.wait_for_element_with_custom_timeout(".c-card-content a", Duration::from_secs(30))?;
+        tab.wait_for_element_with_custom_timeout(".mee-icon-AddMedium", Duration::from_secs(10))?;
 
         let cards = tab
             .find_elements(".c-card-content a")?
@@ -278,7 +326,7 @@ pub(super) fn login_bing(email: &str, password: &str, tab: &Tab) -> Result<()> {
         .wait_for_xpath_with_custom_timeout(
             concat!(
                 "//input[@type='email' or @name='loginfmt']",
-                "|input[@id='usernameEntry']",
+                "|//input[@id='usernameEntry']",
             ),
             Duration::from_secs(10),
         )
@@ -373,7 +421,7 @@ pub(super) fn login_bing(email: &str, password: &str, tab: &Tab) -> Result<()> {
 pub(super) fn check_login_status(tab: &Tab) -> Result<bool> {
     tab.navigate_to(BING_URL)?;
     tab.wait_until_navigated()?;
-    tab.reload(false, None)?;
+    tab.reload(true, None)?;
     sleep(Duration::from_secs(2));
 
     match tab.wait_for_element_with_custom_timeout("#id_s", Duration::from_secs(25)) {
@@ -416,12 +464,19 @@ fn get_pc_search_process(tab: &Tab) -> Result<(u32, u32)> {
     tab.navigate_to("https://rewards.bing.com/pointsbreakdown")?;
     tab.wait_until_navigated()?;
 
-    let ele = tab.wait_for_element_with_custom_timeout(
-        "#userPointsBreakdown > div > div:nth-child(2) > div > div:nth-child(1) > div > div.pointsDetail > mee-rewards-user-points-details > div > div > div > div > p.pointsDetail.c-subheading-3.ng-binding",
-        Duration::from_secs(40),
-    ).map_err(|e| anyhow!(format!("没有找到电脑搜索积分：{}", e)))?;
+    let text = (|| move_to_reward(tab)).retry(3)?;
 
-    let text = ele.get_inner_text()?;
+    let html = scraper::Html::parse_document(&text);
+    let selector = scraper::Selector::parse(
+        "#userPointsBreakdown > div > div:nth-child(2) > div > div:nth-child(1) > div > div.pointsDetail > mee-rewards-user-points-details > div > div > div > div > p.pointsDetail.c-subheading-3.ng-binding",
+    ).unwrap();
+
+    let text = html
+        .select(&selector)
+        .next()
+        .ok_or(anyhow!("没有找到今日搜索积分"))?
+        .text()
+        .collect::<String>();
 
     let mut parts = text.split('/');
 
@@ -437,4 +492,20 @@ fn get_pc_search_process(tab: &Tab) -> Result<(u32, u32)> {
         .parse()?;
 
     Ok((cur_points, max_points))
+}
+
+fn move_to_reward(tab: &Tab) -> Result<String> {
+    sleep(Duration::from_secs(5));
+
+    tab.reload(false, None)?;
+
+    tab.wait_for_element_with_custom_timeout(
+            "#userPointsBreakdown > div > div:nth-child(2) > div > div:nth-child(1) > div > div.pointsDetail > mee-rewards-user-points-details > div > div > div > div > p.pointsDetail.c-subheading-3.ng-binding",
+            Duration::from_secs(30),
+        ).map_err(|e| anyhow!(format!("没有找到电脑搜索积分：{}", e)))?;
+
+    let text = tab
+        .get_content()
+        .map_err(|e| anyhow!(format!("获取积分页面失败：{}", e)))?;
+    Ok(text)
 }

@@ -18,8 +18,11 @@ mod mobile;
 mod pc;
 mod retry;
 
+#[cfg(feature = "debug")]
+const HEADLESS: bool = false;
+#[cfg(not(feature = "debug"))]
 const HEADLESS: bool = true;
-const BING_URL: &str = "https://cn.bing.com/";
+const BING_URL: &str = "https://www.bing.com/";
 const REWARDS_URL: &str = "https://rewards.bing.com/";
 const SLEEP_RANGE: std::ops::Range<u64> = 30..80;
 const GAP_RANGE: std::ops::Range<u64> = 600..1200;
@@ -29,6 +32,10 @@ const GAP_NUM: u32 = 4;
 pub(crate) struct BingBot {
     pub(crate) browser: ManuallyDrop<Browser>,
     temp_dir: Option<tempfile::TempDir>,
+    store_local: bool,
+    account: String,
+    browser_path: Option<String>,
+    proxy: Option<String>,
 }
 
 impl Drop for BingBot {
@@ -43,22 +50,24 @@ impl Drop for BingBot {
     }
 }
 
-#[derive(serde::Deserialize)]
+#[derive(serde::Deserialize, Default)]
 struct Config {
     accounts: Vec<Account>,
-    max_threads: Option<usize>,
-    store_local: Option<bool>,
-    browser_path: Option<String>,
-    schedule: Option<String>,
-    mobile: Option<bool>,
-}
-
-struct ConfigHelper {
-    accounts: Vec<Account>,
+    #[serde(default = "default_max_threads")]
     max_threads: usize,
+    #[serde(default)]
     store_local: bool,
     browser_path: Option<String>,
+    schedule: Option<String>,
+    #[serde(default = "default_mobile_true")]
     mobile: bool,
+}
+
+fn default_max_threads() -> usize {
+    1
+}
+fn default_mobile_true() -> bool {
+    true
 }
 
 #[derive(serde::Deserialize, Clone)]
@@ -68,28 +77,15 @@ struct Account {
     proxy: Option<String>,
 }
 
-impl ConfigHelper {
-    fn from_config(config: Config) -> Self {
-        ConfigHelper {
-            max_threads: config.max_threads.unwrap_or(1),
-            store_local: config.store_local.unwrap_or(false),
-            browser_path: config.browser_path,
-            mobile: config.mobile.unwrap_or(true),
-            accounts: config.accounts,
-        }
-    }
-}
-
 pub(crate) fn process<P: AsRef<Path>>(config_file: P) -> Result<()> {
     let config_file = std::fs::File::open(config_file)?;
 
-    let config: Config = serde_json::from_reader(config_file)?;
+    let config: Arc<Config> = Arc::new(serde_json::from_reader(config_file)?);
 
     if let Some(schedule) = config.schedule.as_deref() {
         let schedule = croner::Cron::from_str(schedule)
             .inspect_err(|e| error!("定时任务格式串解析有误：{}", e))?;
 
-        let config_helper = Arc::new(ConfigHelper::from_config(config));
         for time in schedule.iter_after(Local::now()) {
             let now = Local::now();
             let duration = time.signed_duration_since(now);
@@ -100,19 +96,18 @@ pub(crate) fn process<P: AsRef<Path>>(config_file: P) -> Result<()> {
                 duration.as_secs()
             );
             sleep(duration);
-            if let Err(e) = process_once(Arc::clone(&config_helper)) {
+            if let Err(e) = process_once(Arc::clone(&config)) {
                 error!("定时任务执行失败：{}", e);
             }
         }
     } else {
-        let config_helper = Arc::new(ConfigHelper::from_config(config));
-        process_once(Arc::clone(&config_helper))?;
+        process_once(config)?;
     }
 
     Ok(())
 }
 
-fn process_once(config: Arc<ConfigHelper>) -> Result<()> {
+fn process_once(config: Arc<Config>) -> Result<()> {
     let (tx, rx) = crossbeam::channel::unbounded();
 
     let max_threads = config.max_threads;
@@ -126,7 +121,7 @@ fn process_once(config: Arc<ConfigHelper>) -> Result<()> {
                 info!("==== 第 {} 个线程启动 ====", i);
                 for account in rx {
                     info!("==== 第 {} 个线程处理账号 {} ====", i, account.email);
-                    process_account(account, Arc::clone(&config));
+                    process_account(account, config.as_ref());
                 }
 
                 info!("==== 第 {} 个线程结束 ====", i);
@@ -148,14 +143,15 @@ fn process_once(config: Arc<ConfigHelper>) -> Result<()> {
     Ok(())
 }
 
-fn process_account(account: Account, config: Arc<ConfigHelper>) {
-    let ConfigHelper {
+fn process_account(
+    account: Account,
+    &Config {
         store_local,
         ref browser_path,
         mobile,
         ..
-    } = *config.as_ref();
-
+    }: &Config,
+) {
     let _ = (|| {
         let mut bot =
             BingBot::new_pc_browser(store_local, &account.email, browser_path, &account.proxy);
@@ -229,8 +225,7 @@ fn default_options_builder() -> LaunchOptionsBuilder<'static> {
     options
         .headless(HEADLESS)
         .enable_gpu(false)
-        // .disable_default_args(true)
-        .idle_browser_timeout(Duration::from_mins(15))
+        .idle_browser_timeout(Duration::from_mins(30))
         .sandbox(false)
         .args(
             [
@@ -241,6 +236,7 @@ fn default_options_builder() -> LaunchOptionsBuilder<'static> {
                 "--disable-plugins",
                 "--disable-images",
                 "--disable-web-security",
+                "--mute-audio",
                 "--no-first-run",
                 "--no-default-browser-check",
             ]
