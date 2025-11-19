@@ -28,12 +28,17 @@ pub(crate) fn fetch_hot_words() -> anyhow::Result<()> {
         }
     }
 
-    all_hot_words.sort_unstable();
-    all_hot_words.dedup();
+    let all_hot_words = modify_hot_words(all_hot_words);
     let mut hot_words_lock = HOT_WORDS.write().unwrap();
     *hot_words_lock = all_hot_words;
     info!("获取热搜词共 {} 条", hot_words_lock.len());
     Ok(())
+}
+
+fn modify_hot_words(mut words: Vec<String>) -> Vec<String> {
+    words.sort_unstable();
+    words.dedup();
+    words
 }
 
 mod test {

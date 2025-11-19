@@ -1,5 +1,4 @@
 use std::{
-    mem::ManuallyDrop,
     path::Path,
     str::FromStr,
     sync::Arc,
@@ -12,8 +11,12 @@ use chrono::Local;
 use headless_chrome::{Browser, LaunchOptionsBuilder, Tab};
 use log::{error, info, warn};
 
-use crate::bing::retry::Retryable;
+use crate::bing::{
+    browser_pool::{BingBot, BrowserPool},
+    retry::Retryable,
+};
 
+mod browser_pool;
 mod mobile;
 mod pc;
 mod retry;
@@ -25,30 +28,8 @@ const HEADLESS: bool = true;
 const BING_URL: &str = "https://www.bing.com/";
 const REWARDS_URL: &str = "https://rewards.bing.com/";
 const SLEEP_RANGE: std::ops::Range<u64> = 30..80;
-const GAP_RANGE: std::ops::Range<u64> = 600..1200;
+const GAP_RANGE: std::ops::Range<u64> = 400..1000;
 const GAP_NUM: u32 = 4;
-
-/// 需要保证 temp_dir 的生命周期长于 browser
-pub(crate) struct BingBot {
-    pub(crate) browser: ManuallyDrop<Browser>,
-    temp_dir: Option<tempfile::TempDir>,
-    store_local: bool,
-    account: String,
-    browser_path: Option<String>,
-    proxy: Option<String>,
-}
-
-impl Drop for BingBot {
-    fn drop(&mut self) {
-        unsafe {
-            ManuallyDrop::drop(&mut self.browser);
-            if let Some(dir) = self.temp_dir.take() {
-                sleep(Duration::from_secs(3));
-                drop(dir);
-            }
-        }
-    }
-}
 
 #[derive(serde::Deserialize, Default)]
 struct Config {
@@ -82,6 +63,8 @@ pub(crate) fn process<P: AsRef<Path>>(config_file: P) -> Result<()> {
 
     let config: Arc<Config> = Arc::new(serde_json::from_reader(config_file)?);
 
+    let pool = Arc::new(BrowserPool::new(config.max_threads));
+
     if let Some(schedule) = config.schedule.as_deref() {
         let schedule = croner::Cron::from_str(schedule)
             .inspect_err(|e| error!("定时任务格式串解析有误：{}", e))?;
@@ -96,50 +79,33 @@ pub(crate) fn process<P: AsRef<Path>>(config_file: P) -> Result<()> {
                 duration.as_secs()
             );
             sleep(duration);
-            if let Err(e) = process_once(Arc::clone(&config)) {
+            if let Err(e) = process_once(Arc::clone(&config), Arc::clone(&pool)) {
                 error!("定时任务执行失败：{}", e);
             }
         }
     } else {
-        process_once(config)?;
+        process_once(config, pool)?;
     }
 
     Ok(())
 }
 
-fn process_once(config: Arc<Config>) -> Result<()> {
-    let (tx, rx) = crossbeam::channel::unbounded();
-
-    let max_threads = config.max_threads;
-
-    let handlers = (1..=max_threads)
-        .map(|i| {
-            let rx: crossbeam::channel::Receiver<Account> = rx.clone();
-
-            let config = Arc::clone(&config);
-            spawn(move || {
-                info!("==== 第 {} 个线程启动 ====", i);
-                for account in rx {
-                    info!("==== 第 {} 个线程处理账号 {} ====", i, account.email);
-                    process_account(account, config.as_ref());
-                }
-
-                info!("==== 第 {} 个线程结束 ====", i);
-            })
-        })
-        .collect::<Vec<_>>();
-
-    drop(rx);
-
+fn process_once(config: Arc<Config>, pool: Arc<BrowserPool>) -> Result<()> {
+    let mut handles = vec![];
     for account in &config.accounts {
-        tx.send(account.clone())?;
+        let account = account.clone();
+        let config = Arc::clone(&config);
+        let pool = Arc::clone(&pool);
+        let handle = spawn(move || {
+            process_account(account, config.as_ref(), Arc::clone(&pool));
+        });
+        handles.push(handle);
     }
 
-    drop(tx);
-
-    for handler in handlers {
-        let _ = handler.join();
+    for handle in handles {
+        handle.join().unwrap();
     }
+
     Ok(())
 }
 
@@ -151,26 +117,29 @@ fn process_account(
         mobile,
         ..
     }: &Config,
+    pool: Arc<BrowserPool>,
 ) {
     let _ = (|| {
-        let mut bot =
-            BingBot::new_pc_browser(store_local, &account.email, browser_path, &account.proxy);
-
+        let mut bot = pool.get_bot();
+        bot.new_pc_browser(store_local, &account.email, browser_path, &account.proxy)?;
+        info!("开始处理 PC 端账号 {}", account.email);
         pc::process_account(&account.email, &account.password, &mut bot)?;
-        sleep(time::Duration::from_secs(3));
         Ok(())
     })
     .retry(2)
     .inspect_err(|e| error!("处理账号 {} 失败: {}", account.email, e));
 
+    sleep(time::Duration::from_secs(3));
+
     if mobile {
         let _ = (|| {
-            mobile::process_account(&account, browser_path, store_local)?;
-            sleep(time::Duration::from_secs(3));
+            mobile::process_account(&account, browser_path, store_local, Arc::clone(&pool))?;
             Ok(())
         })
         .retry(2)
         .inspect_err(|e| error!("处理移动端账号 {} 失败: {}", account.email, e));
+
+        sleep(time::Duration::from_secs(3));
     }
 }
 
@@ -195,11 +164,11 @@ fn shot_when_faild(tab: &Tab, prefix: &str, account: &str) {
         true,
     ) {
         std::fs::create_dir_all("failed").ok();
-        let file_name = format!("{}_failure_{}.png", prefix, account);
+        let file_name = format!("{prefix}_failure_{account}.png");
         if let Err(e) = std::fs::write(Path::new("failed").join(&file_name), &png) {
-            warn!("保存失败截图 failed/{} 失败: {}", file_name, e);
+            warn!("保存失败截图 failed/{file_name} 失败: {e}");
         } else {
-            info!("失败截图已保存为 {}", file_name);
+            info!("失败截图已保存为 {file_name}");
         }
     }
 }

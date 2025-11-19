@@ -1,7 +1,8 @@
-use std::{ffi::OsStr, mem::ManuallyDrop, path::PathBuf, sync::Arc, thread::sleep, time::Duration};
+use std::{ffi::OsStr, path::PathBuf, sync::Arc, thread::sleep, time::Duration};
 
 use headless_chrome::{Browser, Tab};
 use log::{debug, info, warn};
+use rand::seq::IndexedRandom;
 
 use crate::{
     bing::{
@@ -15,11 +16,12 @@ use anyhow::{Result, anyhow};
 
 impl BingBot {
     pub(crate) fn new_pc_browser(
+        &mut self,
         store_local: bool,
         account: &str,
         browser_path: &Option<String>,
         proxy: &Option<String>,
-    ) -> BingBot {
+    ) -> Result<()> {
         let temp_dir = None;
 
         let user_dir = if store_local {
@@ -40,22 +42,19 @@ impl BingBot {
             .proxy_server(proxy.as_deref())
             .args(vec![OsStr::new("--user-agent='Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/142.0.0.0 Safari/537.36'")])
             .build()
-            .unwrap();
-        let browser = Browser::new(options).unwrap();
-        BingBot {
-            browser: ManuallyDrop::new(browser),
-            temp_dir,
-            account: account.to_string(),
-            store_local,
-            browser_path: browser_path.clone(),
-            proxy: proxy.clone(),
-        }
+            ?;
+        let browser = Browser::new(options)?;
+        self.browser = Some(browser);
+        self.temp_dir = temp_dir;
+        self.store_local = store_local;
+        self.account = account.to_string();
+        self.browser_path = browser_path.clone();
+        self.proxy = proxy.clone();
+        Ok(())
     }
 
     pub(crate) fn restart_pc_browser(&mut self) -> Result<()> {
-        unsafe {
-            ManuallyDrop::drop(&mut self.browser);
-        }
+        self.browser.take();
         let user_dir = if self.store_local {
             std::fs::create_dir_all("./user-data").unwrap();
             Some(std::path::PathBuf::from(format!(
@@ -75,7 +74,7 @@ impl BingBot {
             .unwrap();
         let browser = Browser::new(options)?;
 
-        self.browser = ManuallyDrop::new(browser);
+        self.browser = Some(browser);
         debug!("浏览器重启完成");
         Ok(())
     }
@@ -90,7 +89,7 @@ pub(crate) fn process_account(
     browser_bot: &mut BingBot,
 ) -> Result<()> {
     info!("开始登录Bing账号: {}", email);
-    let browser = &mut browser_bot.browser;
+    let browser = browser_bot.get_browser()?;
     let mut tab = get_one_tab(browser)?;
     tab.set_default_timeout(Duration::from_secs(25));
     (|| {
@@ -151,17 +150,16 @@ fn search(browser_bot: &mut BingBot, email: &str, tab: &mut Arc<Tab>) -> Result<
             match get_pc_search_process(tab) {
                 Ok((cur_points, max_points)) => {
                     info!(
-                        "账号 {} 当前搜索积分: {}，今日最大搜索积分: {}",
-                        email, cur_points, max_points
+                        "账号 {email} 当前搜索积分: {cur_points}，今日最大搜索积分: {max_points}"
                     );
                     if cur_points >= max_points {
-                        info!("账号 {} 今日搜索积分已达上限，结束搜索任务", email);
+                        info!("账号 {email} 今日搜索积分已达上限，结束搜索任务");
                         break;
                     }
                 }
                 Err(e) => {
                     shot_when_faild(tab, "rewards_get_failed", email);
-                    warn!("获取账号 {} 积分详情失败: {}", email, e);
+                    warn!("获取账号 {email} 积分详情失败: {e}");
                 }
             }
             rand::random_range(GAP_RANGE)
@@ -191,9 +189,9 @@ fn search(browser_bot: &mut BingBot, email: &str, tab: &mut Arc<Tab>) -> Result<
         }
 
         (|| {
-            perform_search_and_click(&mut browser_bot.browser, tab, &word).inspect_err(|_| {
+            perform_search_and_click(browser_bot.get_browser()?, tab, &word).inspect_err(|_| {
                 if let Ok(_) = browser_bot.restart_pc_browser()
-                    && let Ok(new_tab) = get_one_tab(&mut browser_bot.browser)
+                    && let Ok(new_tab) = get_one_tab(browser_bot.get_browser().expect("怎么回事呢"))
                 {
                     *tab = new_tab;
                 }
@@ -244,14 +242,18 @@ fn perform_search_and_click(browser: &mut Browser, tab: &Tab, word: &str) -> Res
 
     let search_res = tab.wait_for_element("#b_results")?;
 
+    search_res
+        .wait_for_element("li.b_algo")
+        .map_err(|e| anyhow!(format!("没有找到搜索结果：{e}")))?;
+
     let all_res = search_res.find_elements("li.b_algo")?;
 
     let ele = all_res
-        .get(rand::random_range(0..all_res.len()))
+        .choose(&mut rand::rng())
         .ok_or(anyhow!("没有找到搜索结果"))?;
 
     ele.click()
-        .map_err(|e| anyhow!(format!("点击搜索结果失败：{}", e)))?;
+        .map_err(|e| anyhow!(format!("点击搜索结果失败：{e}")))?;
 
     sleep(Duration::from_secs(rand::random_range(5..10)));
 

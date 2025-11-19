@@ -20,6 +20,7 @@ crossbeam = "0.8.4"
 croner = "3.0.1"
 chrono = "0.4"
 linkme = "0.3"
+parking_lot = "0.12.5"
 
 [dev-dependencies]
 rayon = "1.11"
