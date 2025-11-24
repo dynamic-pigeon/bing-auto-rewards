@@ -12,7 +12,11 @@ use crate::{
     random::ExpectedNTrigger,
 };
 
+use crate::bing::get_one_tab;
 use anyhow::{Result, anyhow};
+
+static PC_USER_AGENT: &str = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/142.0.0.0 Safari/537.36";
+const MAX_PC_SEARCH_TIMES: usize = 35;
 
 impl BingBot {
     pub(crate) fn new_pc_browser(
@@ -25,24 +29,26 @@ impl BingBot {
         let temp_dir = None;
 
         let user_dir = if store_local {
-            std::fs::create_dir_all("./user-data").unwrap();
+            std::fs::create_dir_all("./user-data")?;
             Some(std::path::PathBuf::from(format!(
                 "./user-data/pc_{}",
                 account
             )))
         } else {
-            std::fs::create_dir_all("./tmp").unwrap();
-            let dir = tempfile::TempDir::new_in("./tmp").unwrap();
+            std::fs::create_dir_all("./tmp")?;
+            let dir = tempfile::TempDir::new_in("./tmp")?;
             Some(dir.path().to_path_buf())
         };
-        let options = default_options_builder()
-            .path(browser_path.as_deref().map(PathBuf::from))
-            .user_data_dir(user_dir)
-            .window_size(Some((1920, 1080)))
-            .proxy_server(proxy.as_deref())
-            .args(vec![OsStr::new("--user-agent='Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/142.0.0.0 Safari/537.36'")])
-            .build()
-            ?;
+        let options = default_options_builder(vec![OsStr::new(const_format::formatcp!(
+            "--user-agent='{}'",
+            PC_USER_AGENT
+        ))])
+        .path(browser_path.as_deref().map(PathBuf::from))
+        .user_data_dir(user_dir)
+        .window_size(Some((1920, 1080)))
+        .proxy_server(proxy.as_deref())
+        .build()?;
+
         let browser = Browser::new(options)?;
         self.browser = Some(browser);
         self.temp_dir = temp_dir;
@@ -56,7 +62,7 @@ impl BingBot {
     pub(crate) fn restart_pc_browser(&mut self) -> Result<()> {
         self.browser.take();
         let user_dir = if self.store_local {
-            std::fs::create_dir_all("./user-data").unwrap();
+            std::fs::create_dir_all("./user-data")?;
             Some(std::path::PathBuf::from(format!(
                 "./user-data/pc_{}",
                 self.account
@@ -64,14 +70,15 @@ impl BingBot {
         } else {
             Some(self.temp_dir.as_ref().unwrap().path().to_path_buf())
         };
-        let options = default_options_builder()
-            .path(self.browser_path.as_deref().map(PathBuf::from))
-            .user_data_dir(user_dir)
-            .window_size(Some((1920, 1080)))
-            .proxy_server(self.proxy.as_deref())
-            .args(vec![OsStr::new("--user-agent='Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/142.0.0.0 Safari/537.36'")])
-            .build()
-            .unwrap();
+        let options = default_options_builder(vec![OsStr::new(const_format::formatcp!(
+            "--user-agent='{}'",
+            PC_USER_AGENT
+        ))])
+        .path(self.browser_path.as_deref().map(PathBuf::from))
+        .user_data_dir(user_dir)
+        .window_size(Some((1920, 1080)))
+        .proxy_server(self.proxy.as_deref())
+        .build()?;
         let browser = Browser::new(options)?;
 
         self.browser = Some(browser);
@@ -128,21 +135,8 @@ pub(crate) fn process_account(
     Ok(())
 }
 
-fn get_one_tab(browser: &mut Browser) -> Result<Arc<Tab>> {
-    let tabs = browser.get_tabs().lock().unwrap();
-    if !tabs.is_empty() {
-        tabs[0].set_default_timeout(Duration::from_secs(25));
-        Ok(tabs[0].clone())
-    } else {
-        drop(tabs);
-        let tab = browser.new_tab()?;
-        tab.set_default_timeout(Duration::from_secs(25));
-        Ok(tab)
-    }
-}
-
 fn search(browser_bot: &mut BingBot, email: &str, tab: &mut Arc<Tab>) -> Result<()> {
-    let search_words = crate::hot_searches::get_hot_words(50);
+    let search_words = crate::hot_searches::get_hot_words(MAX_PC_SEARCH_TIMES);
 
     let mut trigger = ExpectedNTrigger::new(GAP_NUM);
     for (i, word) in search_words.into_iter().enumerate() {
@@ -464,14 +458,18 @@ fn click_login_button(tab: &Tab) -> Result<()> {
 
 fn get_pc_search_process(tab: &Tab) -> Result<(u32, u32)> {
     tab.navigate_to("https://rewards.bing.com/pointsbreakdown")?;
-    tab.wait_until_navigated()?;
+    let _ = tab.wait_until_navigated();
 
     let text = (|| move_to_reward(tab)).retry(3)?;
 
     let html = scraper::Html::parse_document(&text);
-    let selector = scraper::Selector::parse(
-        "#userPointsBreakdown > div > div:nth-child(2) > div > div:nth-child(1) > div > div.pointsDetail > mee-rewards-user-points-details > div > div > div > div > p.pointsDetail.c-subheading-3.ng-binding",
-    ).unwrap();
+    let selector = scraper::Selector::parse(concat!(
+        "#userPointsBreakdown",
+        "> div > div:nth-child(2) > div > div:nth-child(1) > div",
+        "> div.pointsDetail > mee-rewards-user-points-details",
+        "> div > div > div > div > p.pointsDetail.c-subheading-3.ng-binding"
+    ))
+    .unwrap();
 
     let text = html
         .select(&selector)
@@ -502,9 +500,15 @@ fn move_to_reward(tab: &Tab) -> Result<String> {
     tab.reload(false, None)?;
 
     tab.wait_for_element_with_custom_timeout(
-            "#userPointsBreakdown > div > div:nth-child(2) > div > div:nth-child(1) > div > div.pointsDetail > mee-rewards-user-points-details > div > div > div > div > p.pointsDetail.c-subheading-3.ng-binding",
-            Duration::from_secs(30),
-        ).map_err(|e| anyhow!(format!("没有找到电脑搜索积分：{}", e)))?;
+        concat!(
+            "#userPointsBreakdown",
+            "> div > div:nth-child(2) > div > div:nth-child(1) > div",
+            "> div.pointsDetail > mee-rewards-user-points-details",
+            "> div > div > div > div > p.pointsDetail.c-subheading-3.ng-binding"
+        ),
+        Duration::from_secs(30),
+    )
+    .map_err(|e| anyhow!(format!("没有找到电脑搜索积分：{}", e)))?;
 
     let text = tab
         .get_content()

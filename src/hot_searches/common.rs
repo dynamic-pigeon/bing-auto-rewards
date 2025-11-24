@@ -5,6 +5,8 @@ use anyhow::Result;
 use linkme::distributed_slice;
 use serde_json::Value;
 
+static USER_AGENT: &str = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/142.0.0.0 Safari/537.36";
+
 #[distributed_slice(HOT_WORDS_PROVIDERS)]
 fn get_baidu_hot_words() -> Result<Vec<String>> {
     let client = reqwest::blocking::ClientBuilder::new()
@@ -266,8 +268,54 @@ fn get_aiqiyi_hot_words() -> Result<Vec<String>> {
     }
 }
 
+#[distributed_slice(HOT_WORDS_PROVIDERS)]
+fn get_163_hot_words() -> Result<Vec<String>> {
+    let client = reqwest::blocking::ClientBuilder::new()
+        .timeout(Duration::from_secs(5))
+        .user_agent(USER_AGENT)
+        .build()?;
+    let resp = client
+        .get("https://gw.m.163.com/nc-main/api/v1/hqc/no-repeat-hot-list?source=hotTag")
+        .send()?;
+
+    let resp: Value = resp.json()?;
+
+    if let Value::Object(mut resp) = resp
+        && let Some(Value::Object(mut data)) = resp.remove("data")
+        && let Some(Value::Array(items)) = data.remove("items")
+    {
+        let hot_words = items
+            .into_iter()
+            .filter_map(|item| {
+                if let Value::Object(mut item) = item
+                    && let Some(Value::String(title)) = item.remove("title")
+                {
+                    Some(title)
+                } else {
+                    None
+                }
+            })
+            .collect::<Vec<_>>();
+        if hot_words.is_empty() {
+            return Err(anyhow::anyhow!("未获取到网易热搜数据"));
+        }
+        Ok(hot_words)
+    } else {
+        Err(anyhow::anyhow!("网易热搜接口返回数据格式异常"))
+    }
+}
+
 #[cfg(test)]
 mod test {
+    #[test]
+    fn test_163_hot_words() {
+        let hot_words = super::get_163_hot_words().unwrap();
+        assert!(!hot_words.is_empty());
+        println!("网易热搜词数量: {}", hot_words.len());
+        for word in hot_words {
+            println!("{}", word);
+        }
+    }
     #[test]
     fn test_aiqiyi_hot_words() {
         let hot_words = super::get_aiqiyi_hot_words().unwrap();

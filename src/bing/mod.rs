@@ -1,4 +1,5 @@
 use std::{
+    ffi::OsStr,
     path::Path,
     str::FromStr,
     sync::Arc,
@@ -68,6 +69,11 @@ pub(crate) fn process<P: AsRef<Path>>(config_file: P) -> Result<()> {
     if let Some(schedule) = config.schedule.as_deref() {
         let schedule = croner::Cron::from_str(schedule)
             .inspect_err(|e| error!("定时任务格式串解析有误：{}", e))?;
+
+        info!("第一次执行无视定时任务");
+        if let Err(e) = process_once(Arc::clone(&config), Arc::clone(&pool)) {
+            error!("定时任务执行失败：{}", e);
+        }
 
         for time in schedule.iter_after(Local::now()) {
             let now = Local::now();
@@ -189,7 +195,20 @@ fn close_tab(before_tabs: Vec<Arc<Tab>>, browser: &mut Browser) -> Result<()> {
     Ok(())
 }
 
-fn default_options_builder() -> LaunchOptionsBuilder<'static> {
+fn get_one_tab(browser: &mut Browser) -> Result<Arc<Tab>> {
+    let tabs = browser.get_tabs().lock().unwrap();
+    if !tabs.is_empty() {
+        tabs[0].set_default_timeout(Duration::from_secs(25));
+        Ok(tabs[0].clone())
+    } else {
+        drop(tabs);
+        let tab = browser.new_tab()?;
+        tab.set_default_timeout(Duration::from_secs(25));
+        Ok(tab)
+    }
+}
+
+fn default_options_builder<'a>(args: Vec<&'a OsStr>) -> LaunchOptionsBuilder<'a> {
     let mut options = LaunchOptionsBuilder::default();
     options
         .headless(HEADLESS)
@@ -211,6 +230,7 @@ fn default_options_builder() -> LaunchOptionsBuilder<'static> {
             ]
             .into_iter()
             .map(std::ffi::OsStr::new)
+            .chain(args)
             .collect(),
         );
     options
