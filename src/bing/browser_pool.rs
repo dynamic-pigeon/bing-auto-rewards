@@ -1,5 +1,6 @@
 use std::{
     ops::{Deref, DerefMut},
+    sync::Arc,
     thread::sleep,
     time::Duration,
 };
@@ -38,6 +39,7 @@ impl Drop for BingBot {
 pub(crate) struct BrowserPool {
     cond: Condvar,
     pool: Mutex<Vec<BingBot>>,
+    mutex: Arc<Mutex<()>>,
 }
 
 pub(crate) struct PoolWrapper<'a> {
@@ -93,10 +95,16 @@ impl BrowserPool {
                 }
                 v
             }),
+            mutex: Arc::new(Mutex::new(())),
         }
     }
 
     pub(crate) fn get_bot<'a>(&'a self) -> PoolWrapper<'a> {
+        let guard = self.mutex.lock_arc();
+        std::thread::spawn(move || {
+            sleep(Duration::from_secs(10));
+            drop(guard);
+        });
         let mut pool = self.pool.lock();
         loop {
             if let Some(bot) = pool.pop() {

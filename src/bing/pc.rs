@@ -258,7 +258,7 @@ fn perform_search_and_click(browser: &mut Browser, tab: &Tab, word: &str) -> Res
 
 fn click_rewards(browser: &mut Browser, tab: &Tab) -> Result<()> {
     tab.navigate_to(REWARDS_URL)?;
-    tab.wait_until_navigated()?;
+    let _ = tab.wait_until_navigated();
 
     (|| {
         tab.reload(false, None)?;
@@ -272,7 +272,13 @@ fn click_rewards(browser: &mut Browser, tab: &Tab) -> Result<()> {
         let cards = tab
             .find_elements(".c-card-content a")?
             .into_iter()
-            .filter(|ele| ele.find_element(".mee-icon-AddMedium").is_ok())
+            .filter(|ele| {
+                ele.wait_for_element_with_custom_timeout(
+                    ".mee-icon-AddMedium",
+                    Duration::from_secs(2),
+                )
+                .is_ok()
+            })
             .collect::<Vec<_>>();
 
         info!("找到 {} 个可点击卡片", cards.len());
