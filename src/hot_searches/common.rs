@@ -7,302 +7,246 @@ use serde_json::Value;
 
 static USER_AGENT: &str = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/142.0.0.0 Safari/537.36";
 
-#[distributed_slice(HOT_WORDS_PROVIDERS)]
-fn get_baidu_hot_words() -> Result<Vec<String>> {
-    let client = reqwest::blocking::ClientBuilder::new()
-        .timeout(Duration::from_secs(5))
-        .build()?;
+/// JSON 路径步骤枚举
+#[derive(Debug, Clone)]
+enum PathStep {
+    /// 从对象中获取键值
+    Key(String),
+    /// 遍历数组中的每个元素
+    Each,
+    /// 过滤数组元素: (字段名, 期望值)
+    Filter(String, String),
+    /// 从当前值提取为字符串
+    Extract,
+}
 
-    let resp = client
-        .get("https://top.baidu.com/api/board?platform=wise&tab=realtime")
-        .send()?;
+/// JSON 路径提取器
+struct JsonPathExtractor {
+    steps: Vec<PathStep>,
+}
 
-    let resp: Value = resp.json()?;
-
-    if resp.get("success") != Some(&Value::Bool(true)) {
-        anyhow::bail!("百度热搜接口返回失败");
+impl JsonPathExtractor {
+    fn new(steps: Vec<PathStep>) -> Self {
+        Self { steps }
     }
 
-    if let Value::Object(mut resp) = resp
-        && let Some(Value::Object(mut data)) = resp.remove("data")
-        && let Some(Value::Array(cards)) = data.remove("cards")
-    {
-        let hot_words = cards
-            .into_iter()
-            .filter_map(|card| {
-                if let Value::Object(mut card) = card {
-                    if card.get("component") != Some(&Value::String("hotList".to_string())) {
-                        return None;
+    fn extract(&self, value: Value) -> Vec<String> {
+        self.extract_recursive(value, &self.steps)
+    }
+
+    fn extract_recursive(&self, value: Value, remaining_steps: &[PathStep]) -> Vec<String> {
+        if remaining_steps.is_empty() {
+            return vec![];
+        }
+
+        match &remaining_steps[0] {
+            PathStep::Key(key) => {
+                if let Value::Object(mut obj) = value {
+                    if let Some(next_value) = obj.remove(key) {
+                        return self.extract_recursive(next_value, &remaining_steps[1..]);
                     }
-                    let Some(Value::Array(content)) = card.remove("content") else {
-                        return None;
-                    };
-
-                    let hot_words = content
+                }
+                vec![]
+            }
+            PathStep::Each => {
+                if let Value::Array(arr) = value {
+                    return arr
                         .into_iter()
-                        .filter_map(|c| {
-                            if let Value::Object(mut c) = c
-                                && let Some(Value::String(query)) = c.remove("query")
-                            {
-                                Some(query)
+                        .flat_map(|item| self.extract_recursive(item, &remaining_steps[1..]))
+                        .collect();
+                }
+                vec![]
+            }
+            PathStep::Filter(field, expected_value) => {
+                if let Value::Array(arr) = value {
+                    return arr
+                        .into_iter()
+                        .filter(|item| {
+                            if let Value::Object(obj) = item {
+                                obj.get(field) == Some(&Value::String(expected_value.clone()))
                             } else {
-                                None
+                                false
                             }
                         })
-                        .collect::<Vec<_>>();
-
-                    Some(hot_words)
-                } else {
-                    None
+                        .flat_map(|item| self.extract_recursive(item, &remaining_steps[1..]))
+                        .collect();
                 }
-            })
-            .flatten()
-            .collect::<Vec<_>>();
-        if hot_words.is_empty() {
-            return Err(anyhow::anyhow!("未获取到百度热搜数据"));
+                vec![]
+            }
+            PathStep::Extract => match value {
+                Value::String(s) => vec![s],
+                _ => vec![],
+            },
         }
-        Ok(hot_words)
-    } else {
-        Err(anyhow::anyhow!("百度热搜接口返回数据格式异常"))
     }
 }
 
-#[distributed_slice(HOT_WORDS_PROVIDERS)]
-fn get_zhihu_hot_words() -> Result<Vec<String>> {
-    let client = reqwest::blocking::ClientBuilder::new()
-        .timeout(Duration::from_secs(5))
-        .build()?;
+/// 宏：定义热搜 API 提取函数
+///
+/// 语法示例：
+/// ```
+/// hot_search_api! {
+///     name: get_example_hot_words,
+///     url: "https://api.example.com/hot",
+///     user_agent: true,
+///     validate: |resp| resp.get("success") == Some(&Value::Bool(true)),
+///     path: [Key("data"), Each, Key("title"), Extract],
+///     error_name: "示例热搜"
+/// }
+/// ```
+macro_rules! hot_search_api {
+    (
+        name: $fn_name:ident,
+        url: $url:expr,
+        $(user_agent: $use_ua:expr,)?
+        $(validate: $validate:expr,)?
+        path: [$($step:expr),+ $(,)?],
+        error_name: $error_name:expr
+    ) => {
+        #[distributed_slice(HOT_WORDS_PROVIDERS)]
+        fn $fn_name() -> Result<Vec<String>> {
+            #[allow(unused_mut)]
+            let mut client_builder = reqwest::blocking::ClientBuilder::new()
+                .timeout(Duration::from_secs(5));
 
-    let resp = client
-        .get("https://api.zhihu.com/topstory/hot-list?limit=10&reverse_order=0")
-        .send()?;
-
-    let resp: Value = resp.json()?;
-
-    if let Value::Object(mut resp) = resp
-        && let Some(Value::Array(data)) = resp.remove("data")
-    {
-        let hot_words = data
-            .into_iter()
-            .filter_map(|item| {
-                if let Value::Object(mut item) = item
-                    && let Some(Value::String(title)) = item.remove("target").and_then(|t| {
-                        if let Value::Object(mut t) = t {
-                            t.remove("title")
-                        } else {
-                            None
-                        }
-                    })
-                {
-                    Some(title)
-                } else {
-                    None
+            $(
+                if $use_ua {
+                    client_builder = client_builder.user_agent(USER_AGENT);
                 }
-            })
-            .collect::<Vec<_>>();
-        if hot_words.is_empty() {
-            return Err(anyhow::anyhow!("未获取到知乎热搜数据"));
+            )?
+
+            let client = client_builder.build()?;
+            let resp = client.get($url).send()?;
+            let resp: Value = resp.json()?;
+
+            $(
+                let validate_fn: fn(&Value) -> bool = $validate;
+                if !validate_fn(&resp) {
+                    anyhow::bail!(concat!($error_name, "接口返回失败"));
+                }
+            )?
+
+            let extractor = JsonPathExtractor::new(vec![$($step),+]);
+            let hot_words = extractor.extract(resp);
+
+            if hot_words.is_empty() {
+                return Err(anyhow::anyhow!(concat!("未获取到", $error_name, "数据")));
+            }
+            Ok(hot_words)
         }
-        Ok(hot_words)
-    } else {
-        Err(anyhow::anyhow!("知乎热搜接口返回数据格式异常"))
-    }
+    };
 }
 
-#[distributed_slice(HOT_WORDS_PROVIDERS)]
-fn get_toutiao_hot_words() -> Result<Vec<String>> {
-    let client = reqwest::blocking::ClientBuilder::new()
-        .timeout(Duration::from_secs(5))
-        .build()?;
+// ============ 使用配置化的方式定义所有热搜 API ============
 
-    let resp = client
-        .get("https://www.toutiao.com/hot-event/hot-board/?origin=toutiao_pc")
-        .send()?;
+use PathStep::*;
 
-    let resp: Value = resp.json()?;
-
-    if let Value::Object(mut resp) = resp
-        && let Some(Value::Array(data)) = resp.remove("data")
-    {
-        let hot_words = data
-            .into_iter()
-            .filter_map(|item| {
-                if let Value::Object(mut item) = item
-                    && let Some(Value::String(title)) = item.remove("Title")
-                {
-                    Some(title)
-                } else {
-                    None
-                }
-            })
-            .collect::<Vec<_>>();
-        if hot_words.is_empty() {
-            return Err(anyhow::anyhow!("未获取到头条热搜数据"));
-        }
-        Ok(hot_words)
-    } else {
-        Err(anyhow::anyhow!("头条热搜接口返回数据格式异常"))
-    }
+// 百度热搜
+hot_search_api! {
+    name: get_baidu_hot_words,
+    url: "https://top.baidu.com/api/board?platform=wise&tab=realtime",
+    user_agent: true,
+    validate: |resp: &Value| resp.get("success") == Some(&Value::Bool(true)),
+    path: [
+        Key("data".into()),
+        Key("cards".into()),
+        Filter("component".into(), "tabTextList".into()),
+        Key("content".into()),
+        Each,
+        Key("content".into()),
+        Each,
+        Key("word".into()),
+        Extract
+    ],
+    error_name: "百度热搜"
 }
 
-#[distributed_slice(HOT_WORDS_PROVIDERS)]
-fn get_baidu_tiba_hot_words() -> Result<Vec<String>> {
-    let client = reqwest::blocking::ClientBuilder::new()
-        .timeout(Duration::from_secs(5))
-        .build()?;
-
-    let resp = client
-        .get("https://tieba.baidu.com/hottopic/browse/topicList")
-        .send()?;
-
-    let resp: Value = resp.json()?;
-
-    if let Value::Object(mut resp) = resp
-        && let Some(Value::Object(mut data)) = resp.remove("data")
-        && let Some(Value::Object(mut bang_topic)) = data.remove("bang_topic")
-        && let Some(Value::Array(topic_list)) = bang_topic.remove("topic_list")
-    {
-        let hot_words = topic_list
-            .into_iter()
-            .filter_map(|item| {
-                if let Value::Object(mut item) = item
-                    && let Some(Value::String(title)) = item.remove("topic_name")
-                {
-                    Some(title)
-                } else {
-                    None
-                }
-            })
-            .collect::<Vec<_>>();
-        if hot_words.is_empty() {
-            return Err(anyhow::anyhow!("未获取到百度贴吧热搜数据"));
-        }
-        Ok(hot_words)
-    } else {
-        Err(anyhow::anyhow!("百度贴吧热搜接口返回数据格式异常"))
-    }
+// 知乎热搜
+hot_search_api! {
+    name: get_zhihu_hot_words,
+    url: "https://api.zhihu.com/topstory/hot-list?limit=10&reverse_order=0",
+    path: [
+        Key("data".into()),
+        Each,
+        Key("target".into()),
+        Key("title".into()),
+        Extract
+    ],
+    error_name: "知乎热搜"
 }
 
-#[distributed_slice(HOT_WORDS_PROVIDERS)]
-fn get_blibli_tiba_hot_words() -> Result<Vec<String>> {
-    let client = reqwest::blocking::ClientBuilder::new()
-        .timeout(Duration::from_secs(5))
-        .build()?;
-    let resp = client
-        .get("https://api.bilibili.com/x/web-interface/ranking/v2?rid=0&type=all")
-        .send()?;
-
-    let resp: Value = resp.json()?;
-
-    if let Value::Object(mut resp) = resp
-        && let Some(Value::Object(mut data)) = resp.remove("data")
-        && let Some(Value::Array(list)) = data.remove("list")
-    {
-        let hot_words = list
-            .into_iter()
-            .filter_map(|item| {
-                if let Value::Object(mut item) = item
-                    && let Some(Value::String(title)) = item.remove("title")
-                {
-                    Some(title)
-                } else {
-                    None
-                }
-            })
-            .collect::<Vec<_>>();
-        if hot_words.is_empty() {
-            return Err(anyhow::anyhow!("未获取到哔哩哔哩热搜数据"));
-        }
-        Ok(hot_words)
-    } else {
-        Err(anyhow::anyhow!("哔哩哔哩热搜接口返回数据格式异常"))
-    }
+// 头条热搜
+hot_search_api! {
+    name: get_toutiao_hot_words,
+    url: "https://www.toutiao.com/hot-event/hot-board/?origin=toutiao_pc",
+    path: [
+        Key("data".into()),
+        Each,
+        Key("Title".into()),
+        Extract
+    ],
+    error_name: "头条热搜"
 }
 
-#[distributed_slice(HOT_WORDS_PROVIDERS)]
-fn get_aiqiyi_hot_words() -> Result<Vec<String>> {
-    let client = reqwest::blocking::ClientBuilder::new()
-        .timeout(Duration::from_secs(5))
-        .build()?;
-    let resp = client
-        .get("https://mesh.if.iqiyi.com/portal/pcw/rankList/comSecRankList?category_id=-1")
-        .send()?;
-
-    let resp: Value = resp.json()?;
-
-    if let Value::Object(mut resp) = resp
-        && let Some(Value::Object(mut data)) = resp.remove("data")
-        && let Some(Value::Array(list)) = data.remove("items")
-    {
-        let hot_words = list
-            .into_iter()
-            .filter_map(|item| {
-                if let Value::Object(mut item) = item
-                    && let Some(Value::Array(contents)) = item.remove("contents")
-                {
-                    let hot_words = contents
-                        .into_iter()
-                        .filter_map(|c| {
-                            if let Value::Object(mut c) = c
-                                && let Some(Value::String(title)) = c.remove("title")
-                            {
-                                Some(title)
-                            } else {
-                                None
-                            }
-                        })
-                        .collect::<Vec<_>>();
-                    Some(hot_words)
-                } else {
-                    None
-                }
-            })
-            .flatten()
-            .collect::<Vec<_>>();
-        if hot_words.is_empty() {
-            return Err(anyhow::anyhow!("未获取到爱奇艺热搜数据"));
-        }
-        Ok(hot_words)
-    } else {
-        Err(anyhow::anyhow!("爱奇艺热搜接口返回数据格式异常"))
-    }
+// 百度贴吧热搜
+hot_search_api! {
+    name: get_baidu_tiba_hot_words,
+    url: "https://tieba.baidu.com/hottopic/browse/topicList",
+    path: [
+        Key("data".into()),
+        Key("bang_topic".into()),
+        Key("topic_list".into()),
+        Each,
+        Key("topic_name".into()),
+        Extract
+    ],
+    error_name: "百度贴吧热搜"
 }
 
-#[distributed_slice(HOT_WORDS_PROVIDERS)]
-fn get_163_hot_words() -> Result<Vec<String>> {
-    let client = reqwest::blocking::ClientBuilder::new()
-        .timeout(Duration::from_secs(5))
-        .user_agent(USER_AGENT)
-        .build()?;
-    let resp = client
-        .get("https://gw.m.163.com/nc-main/api/v1/hqc/no-repeat-hot-list?source=hotTag")
-        .send()?;
+// 哔哩哔哩热搜
+hot_search_api! {
+    name: get_blibli_tiba_hot_words,
+    url: "https://api.bilibili.com/x/web-interface/ranking/v2?rid=0&type=all",
+    path: [
+        Key("data".into()),
+        Key("list".into()),
+        Each,
+        Key("title".into()),
+        Extract
+    ],
+    error_name: "哔哩哔哩热搜"
+}
 
-    let resp: Value = resp.json()?;
+// 爱奇艺热搜
+hot_search_api! {
+    name: get_aiqiyi_hot_words,
+    url: "https://mesh.if.iqiyi.com/portal/pcw/rankList/comSecRankList?category_id=-1",
+    user_agent: true,
+    path: [
+        Key("data".into()),
+        Key("items".into()),
+        Each,
+        Key("contents".into()),
+        Each,
+        Key("title".into()),
+        Extract
+    ],
+    error_name: "爱奇艺热搜"
+}
 
-    if let Value::Object(mut resp) = resp
-        && let Some(Value::Object(mut data)) = resp.remove("data")
-        && let Some(Value::Array(items)) = data.remove("items")
-    {
-        let hot_words = items
-            .into_iter()
-            .filter_map(|item| {
-                if let Value::Object(mut item) = item
-                    && let Some(Value::String(title)) = item.remove("title")
-                {
-                    Some(title)
-                } else {
-                    None
-                }
-            })
-            .collect::<Vec<_>>();
-        if hot_words.is_empty() {
-            return Err(anyhow::anyhow!("未获取到网易热搜数据"));
-        }
-        Ok(hot_words)
-    } else {
-        Err(anyhow::anyhow!("网易热搜接口返回数据格式异常"))
-    }
+// 网易热搜
+hot_search_api! {
+    name: get_163_hot_words,
+    url: "https://gw.m.163.com/nc-main/api/v1/hqc/no-repeat-hot-list?source=hotTag",
+    user_agent: true,
+    path: [
+        Key("data".into()),
+        Key("items".into()),
+        Each,
+        Key("title".into()),
+        Extract
+    ],
+    error_name: "网易热搜"
 }
 
 #[cfg(test)]

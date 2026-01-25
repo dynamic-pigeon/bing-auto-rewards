@@ -469,13 +469,9 @@ fn get_pc_search_process(tab: &Tab) -> Result<(u32, u32)> {
     let text = (|| move_to_reward(tab)).retry(3)?;
 
     let html = scraper::Html::parse_document(&text);
-    let selector = scraper::Selector::parse(concat!(
-        "#userPointsBreakdown",
-        "> div > div:nth-child(2) > div > div:nth-child(1) > div",
-        "> div.pointsDetail > mee-rewards-user-points-details",
-        "> div > div > div > div > p.pointsDetail.c-subheading-3.ng-binding"
-    ))
-    .unwrap();
+    let selector =
+        scraper::Selector::parse("#bingSearchDailyPoints > mee-rewards-level-progress-bar > p")
+            .unwrap();
 
     let text = html
         .select(&selector)
@@ -486,18 +482,21 @@ fn get_pc_search_process(tab: &Tab) -> Result<(u32, u32)> {
 
     let mut parts = text.split('/');
 
-    let cur_points = parts
-        .next()
-        .ok_or(anyhow!("没有找到今日分数"))?
-        .trim()
-        .parse()?;
-    let max_points = parts
-        .next()
-        .ok_or(anyhow!("没有找到今日最大分数"))?
-        .trim()
-        .parse()?;
+    let cur_points = parse_point(parts.next().ok_or(anyhow!("没有找到今日搜索分数"))?)?;
+    let max_points = parse_point(parts.next().ok_or(anyhow!("没有找到今日最大分数"))?)?;
 
     Ok((cur_points, max_points))
+}
+
+fn parse_point(text: &str) -> Result<u32> {
+    let re = regex::Regex::new(r"(\d+)").unwrap();
+    if let Some(caps) = re.captures(text) {
+        if let Some(matched) = caps.get(1) {
+            let points: u32 = matched.as_str().parse()?;
+            return Ok(points);
+        }
+    }
+    Err(anyhow!("无法解析积分"))
 }
 
 fn move_to_reward(tab: &Tab) -> Result<String> {
@@ -520,4 +519,22 @@ fn move_to_reward(tab: &Tab) -> Result<String> {
         .get_content()
         .map_err(|e| anyhow!(format!("获取积分页面失败：{}", e)))?;
     Ok(text)
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+
+    #[test]
+    fn test_parse_point() {
+        let text = "15 个积分/共 60 个(金牌)";
+        let (cur, max) = {
+            let mut parts = text.split('/');
+            let cur_points = parse_point(parts.next().unwrap()).unwrap();
+            let max_points = parse_point(parts.next().unwrap()).unwrap();
+            (cur_points, max_points)
+        };
+        assert_eq!(cur, 15);
+        assert_eq!(max, 60);
+    }
 }
