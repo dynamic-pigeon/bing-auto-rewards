@@ -4,7 +4,7 @@ use std::{
     str::FromStr,
     sync::Arc,
     thread::{sleep, spawn},
-    time::{self, Duration},
+    time::Duration,
 };
 
 use anyhow::Result;
@@ -18,7 +18,6 @@ use crate::bing::{
 };
 
 mod browser_pool;
-mod mobile;
 mod pc;
 mod retry;
 
@@ -41,15 +40,10 @@ struct Config {
     store_local: bool,
     browser_path: Option<String>,
     schedule: Option<String>,
-    #[serde(default = "default_mobile_true")]
-    mobile: bool,
 }
 
 fn default_max_threads() -> usize {
     1
-}
-fn default_mobile_true() -> bool {
-    true
 }
 
 #[derive(serde::Deserialize, Clone)]
@@ -120,7 +114,6 @@ fn process_account(
     &Config {
         store_local,
         ref browser_path,
-        mobile,
         ..
     }: &Config,
     pool: Arc<BrowserPool>,
@@ -134,19 +127,6 @@ fn process_account(
     })
     .retry(2)
     .inspect_err(|e| error!("处理账号 {} 失败: {}", account.email, e));
-
-    sleep(time::Duration::from_secs(3));
-
-    if mobile {
-        let _ = (|| {
-            mobile::process_account(&account, browser_path, store_local, Arc::clone(&pool))?;
-            Ok(())
-        })
-        .retry(2)
-        .inspect_err(|e| error!("处理移动端账号 {} 失败: {}", account.email, e));
-
-        sleep(time::Duration::from_secs(3));
-    }
 }
 
 #[allow(dead_code)]
