@@ -1,5 +1,6 @@
 use std::{ffi::OsStr, path::PathBuf, sync::Arc, thread::sleep, time::Duration};
 
+use anyhow::{Result, anyhow};
 use headless_chrome::{Browser, Tab};
 use log::{debug, info, warn};
 use rand::seq::IndexedRandom;
@@ -7,13 +8,10 @@ use rand::seq::IndexedRandom;
 use crate::{
     bing::{
         BING_URL, BingBot, GAP_NUM, GAP_RANGE, REWARDS_URL, SLEEP_RANGE, close_tab,
-        default_options_builder, retry::Retryable, shot_when_faild,
+        default_options_builder, get_one_tab, retry::Retryable, shot_when_faild,
     },
     random::ExpectedNTrigger,
 };
-
-use crate::bing::get_one_tab;
-use anyhow::{Result, anyhow};
 
 static PC_USER_AGENT: &str = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/142.0.0.0 Safari/537.36";
 const MAX_PC_SEARCH_TIMES: usize = 35;
