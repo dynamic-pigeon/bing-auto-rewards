@@ -14,7 +14,7 @@ use crate::{
 };
 
 static PC_USER_AGENT: &str = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/142.0.0.0 Safari/537.36";
-const MAX_PC_SEARCH_TIMES: usize = 35;
+const MAX_PC_SEARCH_TIMES: usize = 20;
 
 impl BingBot {
     pub(crate) fn new_pc_browser(
@@ -198,37 +198,12 @@ fn search(browser_bot: &mut BingBot, email: &str, tab: &mut Arc<Tab>) -> Result<
 }
 
 fn perform_search_and_click(browser: &mut Browser, tab: &Tab, word: &str) -> Result<()> {
-    tab.activate()
-        .map_err(|e| anyhow!(format!("activate 失败：{}", e)))?;
-    tab.navigate_to(BING_URL)
-        .map_err(|e| anyhow!(format!("前往 BING_URL失败：{}", e)))?;
-    sleep(Duration::from_secs(2));
-    tab.reload(false, None)
-        .map_err(|e| anyhow!(format!("重新加载失败：{}", e)))?;
-
-    sleep(Duration::from_secs(1));
-
-    let search_input = tab
-        .wait_for_xpath_with_custom_timeout(
-            "//input[@name='q']|//*[@id='sb_form_q']",
-            Duration::from_secs(10),
-        )
-        .map_err(|e| anyhow!(format!("寻找输入框失败：{}", e)))?;
-
-    search_input
-        .type_into(word)
-        .map_err(|e| anyhow!(format!("输入失败：{}", e)))?;
-
-    debug!("输入搜索词：{} 成功", word);
-
     let before_tabs = browser.get_tabs().lock().unwrap().clone();
 
-    let search_button = tab
-        .find_element_by_xpath("//label[@id='search_icon']")
-        .map_err(|e| anyhow!(format!("寻找搜索按钮失败：{}", e)))?;
-    search_button
-        .click()
-        .map_err(|e| anyhow!(format!("搜索按钮点击失败：{}", e)))?;
+    tab.navigate_to(&format!(
+        "https://cn.bing.com/search?q={}&PC=U316&FORM=CHROMN",
+        word
+    ))?;
 
     sleep(Duration::from_secs(rand::random_range(1..4)));
 
@@ -464,7 +439,7 @@ fn get_pc_search_process(tab: &Tab) -> Result<(u32, u32)> {
     tab.navigate_to("https://rewards.bing.com/pointsbreakdown")?;
     let _ = tab.wait_until_navigated();
 
-    let text = (|| move_to_reward(tab)).retry(3)?;
+    let text = tab.get_content()?;
 
     let html = scraper::Html::parse_document(&text);
     let selector =
@@ -495,28 +470,6 @@ fn parse_point(text: &str) -> Result<u32> {
         }
     }
     Err(anyhow!("无法解析积分"))
-}
-
-fn move_to_reward(tab: &Tab) -> Result<String> {
-    sleep(Duration::from_secs(5));
-
-    tab.reload(false, None)?;
-
-    tab.wait_for_element_with_custom_timeout(
-        concat!(
-            "#userPointsBreakdown",
-            "> div > div:nth-child(2) > div > div:nth-child(1) > div",
-            "> div.pointsDetail > mee-rewards-user-points-details",
-            "> div > div > div > div > p.pointsDetail.c-subheading-3.ng-binding"
-        ),
-        Duration::from_secs(30),
-    )
-    .map_err(|e| anyhow!(format!("没有找到电脑搜索积分：{}", e)))?;
-
-    let text = tab
-        .get_content()
-        .map_err(|e| anyhow!(format!("获取积分页面失败：{}", e)))?;
-    Ok(text)
 }
 
 #[cfg(test)]
