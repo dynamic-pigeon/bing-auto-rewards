@@ -1,4 +1,10 @@
-use std::{ffi::OsStr, path::PathBuf, sync::Arc, thread::sleep, time::Duration};
+use std::{
+    ffi::OsStr,
+    path::{Path, PathBuf},
+    sync::Arc,
+    thread::sleep,
+    time::{Duration, SystemTime, UNIX_EPOCH},
+};
 
 use anyhow::{Result, anyhow};
 use headless_chrome::{Browser, Tab};
@@ -7,7 +13,7 @@ use rand::seq::IndexedRandom;
 
 use crate::{
     bing::{
-        BING_URL, BingBot, GAP_NUM, GAP_RANGE, REWARDS_URL, SLEEP_RANGE, close_tab,
+        BING_URL, BingBot, GAP_NUM, GAP_RANGE, REWARDS_URL, REWARDS_URL_DS, SLEEP_RANGE, close_tab,
         default_options_builder, get_one_tab, retry::Retryable, shot_when_faild,
     },
     random::ExpectedNTrigger,
@@ -28,10 +34,10 @@ impl BingBot {
 
         let user_dir = if store_local {
             std::fs::create_dir_all("./user-data")?;
-            Some(std::path::PathBuf::from(format!(
-                "./user-data/pc_{}",
-                account
-            )))
+            let user_data_dir = std::path::PathBuf::from(format!("./user-data/pc_{}", account));
+            std::fs::create_dir_all(&user_data_dir)?;
+            mark_user_data_last_used(&user_data_dir)?;
+            Some(user_data_dir)
         } else {
             std::fs::create_dir_all("./tmp")?;
             let dir = tempfile::TempDir::new_in("./tmp")?;
@@ -61,10 +67,11 @@ impl BingBot {
         self.browser.take();
         let user_dir = if self.store_local {
             std::fs::create_dir_all("./user-data")?;
-            Some(std::path::PathBuf::from(format!(
-                "./user-data/pc_{}",
-                self.account
-            )))
+            let user_data_dir =
+                std::path::PathBuf::from(format!("./user-data/pc_{}", self.account));
+            std::fs::create_dir_all(&user_data_dir)?;
+            mark_user_data_last_used(&user_data_dir)?;
+            Some(user_data_dir)
         } else {
             Some(self.temp_dir.as_ref().unwrap().path().to_path_buf())
         };
@@ -83,6 +90,15 @@ impl BingBot {
         debug!("浏览器重启完成");
         Ok(())
     }
+}
+
+fn mark_user_data_last_used(user_data_dir: &Path) -> Result<()> {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_else(|_| Duration::from_secs(0))
+        .as_secs();
+    std::fs::write(user_data_dir.join(".last_used"), now.to_string())?;
+    Ok(())
 }
 
 /// 为什么是 &mut BingBot 而不是 &BingBot
@@ -230,49 +246,66 @@ fn perform_search_and_click(browser: &mut Browser, tab: &Tab, word: &str) -> Res
 }
 
 fn click_rewards(browser: &mut Browser, tab: &Tab) -> Result<()> {
-    tab.navigate_to(REWARDS_URL)?;
-    let _ = tab.wait_until_navigated();
-
-    (|| {
-        tab.reload(false, None)?;
-
-        sleep(Duration::from_secs(2));
-        info!("开始寻找可点击卡片");
-
-        tab.wait_for_element_with_custom_timeout(".c-card-content a", Duration::from_secs(30))?;
-        tab.wait_for_element_with_custom_timeout(".mee-icon-AddMedium", Duration::from_secs(10))?;
-
-        let cards = tab
-            .find_elements(".c-card-content a")?
-            .into_iter()
-            .filter(|ele| {
-                ele.wait_for_element_with_custom_timeout(
-                    ".mee-icon-AddMedium",
-                    Duration::from_secs(2),
-                )
-                .is_ok()
-            })
-            .collect::<Vec<_>>();
-
-        info!("找到 {} 个可点击卡片", cards.len());
-
-        for card in cards {
-            let before_tabs = browser.get_tabs().lock().unwrap().clone();
-
-            // 有些页面元素可能被遮挡，直接调用 JS 的 click() 更稳健
-            match card.call_js_fn("function() { this.click(); }", vec![], false) {
-                Ok(_) => info!("通过 JS 点击卡片成功"),
-                Err(e) => warn!("通过 JS 点击卡片失败：{}", e),
-            }
-
-            sleep(Duration::from_secs(5));
-            close_tab(before_tabs, browser)?;
-        }
-        Ok(())
-    })
-    .retry(3)?;
+    (|| click_daily_set(browser, tab))
+        .retry(3)
+        .inspect_err(|e| {
+            warn!("点击奖励卡片失败: {e}");
+        })?;
+    (|| click_earn(browser, tab)).retry(3).inspect_err(|e| {
+        warn!("点击奖励卡片失败: {e}");
+    })?;
 
     info!("卡片点击完成");
+    Ok(())
+}
+
+fn click_earn(browser: &mut Browser, tab: &Tab) -> Result<()> {
+    tab.navigate_to(REWARDS_URL)?;
+    tab.wait_until_navigated()?;
+
+    let ele = tab.wait_for_element("#moreactivities > div > div:nth-of-type(2)")?;
+    let ele = ele.wait_for_elements("a")?;
+    info!("找到 {} 个奖励卡片，准备点击", ele.len());
+
+    for card in ele {
+        let text = card.get_inner_text().unwrap_or_default();
+        if !text.contains("+") {
+            continue;
+        }
+
+        let before_tabs = browser.get_tabs().lock().unwrap().clone();
+        match card.call_js_fn("function() { this.click(); }", vec![], false) {
+            Ok(_) => info!("通过 JS 点击奖励卡片成功"),
+            Err(e) => warn!("通过 JS 点击奖励卡片失败：{}", e),
+        }
+        sleep(Duration::from_secs(5));
+        let _ = close_tab(before_tabs, browser);
+        sleep(Duration::from_secs(1));
+    }
+
+    Ok(())
+}
+
+fn click_daily_set(browser: &mut Browser, tab: &Tab) -> Result<()> {
+    while tab.get_url() != REWARDS_URL_DS {
+        tab.navigate_to(REWARDS_URL_DS)?;
+        tab.wait_until_navigated()?;
+    }
+    let ele = tab.wait_for_element("#dailyset > div > div:nth-of-type(2)")?;
+    let ele = ele.wait_for_elements("a")?;
+    info!("找到 {} 个每日任务卡片，准备点击", ele.len());
+
+    for card in ele {
+        let before_tabs = browser.get_tabs().lock().unwrap().clone();
+        match card.call_js_fn("function() { this.click(); }", vec![], false) {
+            Ok(_) => info!("通过 JS 点击每日任务卡片成功"),
+            Err(e) => warn!("通过 JS 点击每日任务卡片失败：{}", e),
+        }
+        sleep(Duration::from_secs(5));
+        let _ = close_tab(before_tabs, browser);
+        sleep(Duration::from_secs(1));
+    }
+
     Ok(())
 }
 
@@ -436,22 +469,15 @@ fn click_login_button(tab: &Tab) -> Result<()> {
 }
 
 fn get_pc_search_process(tab: &Tab) -> Result<(u32, u32)> {
-    tab.navigate_to("https://rewards.bing.com/pointsbreakdown")?;
+    tab.navigate_to("https://rewards.bing.com/earn")?;
     let _ = tab.wait_until_navigated();
-
-    let text = tab.get_content()?;
-
-    let html = scraper::Html::parse_document(&text);
-    let selector =
-        scraper::Selector::parse("#bingSearchDailyPoints > mee-rewards-level-progress-bar > p")
-            .unwrap();
-
-    let text = html
-        .select(&selector)
-        .next()
-        .ok_or(anyhow!("没有找到今日搜索积分"))?
-        .text()
-        .collect::<String>();
+    let ele = tab.wait_for_element("#shell > div.grow > div > main > div")?;
+    let button = ele.wait_for_element("button")?;
+    button.click()?;
+    sleep(Duration::from_secs(3));
+    let ele =
+        tab.wait_for_xpath("/html/body/div[3]/div/section/div/div[2]/div/div[1]/div[2]/div[4]")?;
+    let text = ele.get_inner_text()?;
 
     let mut parts = text.split('/');
 
