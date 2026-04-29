@@ -477,21 +477,19 @@ fn get_pc_search_process(tab: &Tab) -> Result<(u32, u32)> {
         tab.wait_for_xpath("/html/body/div[3]/div/section/div/div[2]/div/div[1]/div[2]/div[4]")?;
     let text = ele.get_inner_text()?;
 
-    let mut parts = text.split('/');
-
-    let cur_points = parse_point(parts.next().ok_or(anyhow!("没有找到今日搜索分数"))?)?;
-    let max_points = parse_point(parts.next().ok_or(anyhow!("没有找到今日最大分数"))?)?;
-
+    let (cur_points, max_points) = parse_point(&text)?;
     Ok((cur_points, max_points))
 }
 
-fn parse_point(text: &str) -> Result<u32> {
-    let re = regex::Regex::new(r"(\d+)").unwrap();
-    if let Some(caps) = re.captures(text) {
-        if let Some(matched) = caps.get(1) {
-            let points: u32 = matched.as_str().parse()?;
-            return Ok(points);
-        }
+fn parse_point(text: &str) -> Result<(u32, u32)> {
+    let re = regex::Regex::new(r"(?P<cur>\d+)\D*/\D*(?P<tot>\d+)").unwrap();
+    if let Some(caps) = re.captures(text)
+        && let Some(cur) = caps.name("cur")
+        && let Some(tot) = caps.name("tot")
+    {
+        let cur: u32 = cur.as_str().parse()?;
+        let tot: u32 = tot.as_str().parse()?;
+        return Ok((cur, tot));
     }
     Err(anyhow!("无法解析积分"))
 }
@@ -503,12 +501,11 @@ mod test {
     #[test]
     fn test_parse_point() {
         let text = "15 个积分/共 60 个(金牌)";
-        let (cur, max) = {
-            let mut parts = text.split('/');
-            let cur_points = parse_point(parts.next().unwrap()).unwrap();
-            let max_points = parse_point(parts.next().unwrap()).unwrap();
-            (cur_points, max_points)
-        };
+        let (cur, max) = parse_point(text).unwrap();
+        assert_eq!(cur, 15);
+        assert_eq!(max, 60);
+        let text = "15/60";
+        let (cur, max) = parse_point(text).unwrap();
         assert_eq!(cur, 15);
         assert_eq!(max, 60);
     }
