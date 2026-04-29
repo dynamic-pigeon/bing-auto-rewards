@@ -41,8 +41,6 @@
 - schedule：可选，自动执行配置，[详细参数介绍](https://crates.io/crates/croner)，不填默认执行一次，注意，当这次执行的时候上次执行没有结束，这次执行会被跳过
 - user_data_cleanup_days：可选，仅在 `store_local=true` 时有意义。程序每次执行任务前会清理 `./user-data` 下超过该天数未使用的账号目录（根据目录中的 `.last_used` 记录判断）
 
-本程序启动的时候同时会拉起一个更新热搜的线程，默认两小时执行一次，更新热搜词
-
 ## TODO：
 
 - [ ] 更好的重试机制

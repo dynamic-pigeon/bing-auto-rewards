@@ -287,10 +287,8 @@ fn click_earn(browser: &mut Browser, tab: &Tab) -> Result<()> {
 }
 
 fn click_daily_set(browser: &mut Browser, tab: &Tab) -> Result<()> {
-    while tab.get_url() != REWARDS_URL_DS {
-        tab.navigate_to(REWARDS_URL_DS)?;
-        tab.wait_until_navigated()?;
-    }
+    tab.navigate_to(REWARDS_URL_DS)?;
+    tab.wait_until_navigated()?;
     let ele = tab.wait_for_element("#dailyset > div > div:nth-of-type(2)")?;
     let ele = ele.wait_for_elements("a")?;
     info!("找到 {} 个每日任务卡片，准备点击", ele.len());
