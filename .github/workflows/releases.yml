@@ -49,10 +49,24 @@ jobs:
           target: ${{ matrix.target }}
           override: true
 
+      - name: Install Linux aarch64 toolchain
+        if: matrix.target == 'aarch64-unknown-linux-gnu'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-aarch64-linux-gnu binutils-aarch64-linux-gnu
+
+      - name: Set up MSVC for ARM64
+        if: matrix.target == 'aarch64-pc-windows-msvc'
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: amd64_arm64
+
       - name: Build binary
         run: cargo build --release --target ${{ matrix.target }}
         env:
           RUST_BACKTRACE: 1
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
+          CC_aarch64_unknown_linux_gnu: aarch64-linux-gnu-gcc
 
       - name: Prepare release assets
         shell: pwsh
