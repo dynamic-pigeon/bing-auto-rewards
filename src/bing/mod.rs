@@ -108,7 +108,7 @@ pub(crate) fn process<P: AsRef<Path>>(config_file: P) -> Result<()> {
 
 fn process_once(config: Arc<Config>, pool: Arc<BrowserPool>) -> Result<()> {
     // 启动时先获取一次热搜，顺便检测一下网络是否畅通
-    hot_searches::fetch_hot_words().inspect_err(|e| warn!("获取热搜失败: {}", e))?;
+    hot_searches::fetch_hot_words_blocking().inspect_err(|e| warn!("获取热搜失败: {}", e))?;
 
     let mut handles = vec![];
     for account in &config.accounts {

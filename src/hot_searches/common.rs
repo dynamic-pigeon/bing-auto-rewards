@@ -1,10 +1,9 @@
 use std::time::Duration;
 
-use anyhow::Result;
 use linkme::distributed_slice;
 use serde_json::Value;
 
-use super::HOT_WORDS_PROVIDERS;
+use super::{HOT_WORDS_PROVIDERS, HotWordsFuture};
 
 static USER_AGENT: &str = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/142.0.0.0 Safari/537.36";
 
@@ -105,35 +104,37 @@ macro_rules! hot_search_api {
         error_name: $error_name:expr
     ) => {
         #[distributed_slice(HOT_WORDS_PROVIDERS)]
-        fn $fn_name() -> Result<Vec<String>> {
+        fn $fn_name() -> HotWordsFuture {
             #[allow(unused_mut)]
-            let mut client_builder = reqwest::blocking::ClientBuilder::new()
-                .timeout(Duration::from_secs(5));
+            Box::pin(async move {
+                let mut client_builder = reqwest::ClientBuilder::new()
+                    .timeout(Duration::from_secs(5));
 
-            $(
-                if $use_ua {
-                    client_builder = client_builder.user_agent(USER_AGENT);
+                $(
+                    if $use_ua {
+                        client_builder = client_builder.user_agent(USER_AGENT);
+                    }
+                )?
+
+                let client = client_builder.build()?;
+                let resp = client.get($url).send().await?;
+                let resp: Value = resp.json().await?;
+
+                $(
+                    let validate_fn: fn(&Value) -> bool = $validate;
+                    if !validate_fn(&resp) {
+                        anyhow::bail!(concat!($error_name, "接口返回失败"));
+                    }
+                )?
+
+                let extractor = JsonPathExtractor::new(vec![$($step),+]);
+                let hot_words = extractor.extract(resp);
+
+                if hot_words.is_empty() {
+                    return Err(anyhow::anyhow!(concat!("未获取到", $error_name, "数据")));
                 }
-            )?
-
-            let client = client_builder.build()?;
-            let resp = client.get($url).send()?;
-            let resp: Value = resp.json()?;
-
-            $(
-                let validate_fn: fn(&Value) -> bool = $validate;
-                if !validate_fn(&resp) {
-                    anyhow::bail!(concat!($error_name, "接口返回失败"));
-                }
-            )?
-
-            let extractor = JsonPathExtractor::new(vec![$($step),+]);
-            let hot_words = extractor.extract(resp);
-
-            if hot_words.is_empty() {
-                return Err(anyhow::anyhow!(concat!("未获取到", $error_name, "数据")));
-            }
-            Ok(hot_words)
+                Ok(hot_words)
+            })
         }
     };
 }
@@ -252,18 +253,18 @@ hot_search_api! {
 
 #[cfg(test)]
 mod test {
-    #[test]
-    fn test_163_hot_words() {
-        let hot_words = super::get_163_hot_words().unwrap();
+    #[tokio::test]
+    async fn test_163_hot_words() {
+        let hot_words = super::get_163_hot_words().await.unwrap();
         assert!(!hot_words.is_empty());
         println!("网易热搜词数量: {}", hot_words.len());
         for word in hot_words {
             println!("{}", word);
         }
     }
-    #[test]
-    fn test_aiqiyi_hot_words() {
-        let hot_words = super::get_aiqiyi_hot_words().unwrap();
+    #[tokio::test]
+    async fn test_aiqiyi_hot_words() {
+        let hot_words = super::get_aiqiyi_hot_words().await.unwrap();
         assert!(!hot_words.is_empty());
         println!("爱奇艺热搜词数量: {}", hot_words.len());
         for word in hot_words {
@@ -271,45 +272,45 @@ mod test {
         }
     }
 
-    #[test]
-    fn test_blili_tiba_hot_words() {
-        let hot_words = super::get_blibli_tiba_hot_words().unwrap();
+    #[tokio::test]
+    async fn test_blili_tiba_hot_words() {
+        let hot_words = super::get_blibli_tiba_hot_words().await.unwrap();
         assert!(!hot_words.is_empty());
         println!("哔哩哔哩热搜词数量: {}", hot_words.len());
         for word in hot_words {
             println!("{}", word);
         }
     }
-    #[test]
-    fn test_baidu_tiba_hot_words() {
-        let hot_words = super::get_baidu_tiba_hot_words().unwrap();
+    #[tokio::test]
+    async fn test_baidu_tiba_hot_words() {
+        let hot_words = super::get_baidu_tiba_hot_words().await.unwrap();
         assert!(!hot_words.is_empty());
         println!("百度贴吧热搜词数量: {}", hot_words.len());
         for word in hot_words {
             println!("{}", word);
         }
     }
-    #[test]
-    fn test_toutiao_hot_words() {
-        let hot_words = super::get_toutiao_hot_words().unwrap();
+    #[tokio::test]
+    async fn test_toutiao_hot_words() {
+        let hot_words = super::get_toutiao_hot_words().await.unwrap();
         assert!(!hot_words.is_empty());
         println!("头条热搜词数量: {}", hot_words.len());
         for word in hot_words {
             println!("{}", word);
         }
     }
-    #[test]
-    fn test_zhihu_hot_words() {
-        let hot_words = super::get_zhihu_hot_words().unwrap();
+    #[tokio::test]
+    async fn test_zhihu_hot_words() {
+        let hot_words = super::get_zhihu_hot_words().await.unwrap();
         assert!(!hot_words.is_empty());
         println!("知乎热搜词数量: {}", hot_words.len());
         for word in hot_words {
             println!("{}", word);
         }
     }
-    #[test]
-    fn test_baidu_hot_words() {
-        let hot_words = super::get_baidu_hot_words().unwrap();
+    #[tokio::test]
+    async fn test_baidu_hot_words() {
+        let hot_words = super::get_baidu_hot_words().await.unwrap();
         assert!(!hot_words.is_empty());
         println!("百度热搜词数量: {}", hot_words.len());
         for word in hot_words {
