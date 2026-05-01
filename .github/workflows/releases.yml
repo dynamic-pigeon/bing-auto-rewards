@@ -16,14 +16,27 @@ jobs:
             target: x86_64-unknown-linux-gnu
             binary_name: bing-auto-reward
             archive_ext: tar.gz
+            archive_name: amd64-linux-bing-auto-reward-${{ github.ref_name }}
+          - os: ubuntu-latest
+            target: aarch64-unknown-linux-gnu
+            binary_name: bing-auto-reward
+            archive_ext: tar.gz
+            archive_name: aarch64-linux-bing-auto-reward-${{ github.ref_name }}
+          - os: windows-latest
+            target: aarch64-pc-windows-msvc
+            binary_name: bing-auto-reward.exe
+            archive_ext: zip
+            archive_name: aarch64-windows-bing-auto-reward-${{ github.ref_name }}
           - os: windows-latest
             target: x86_64-pc-windows-msvc
             binary_name: bing-auto-reward.exe
             archive_ext: zip
+            archive_name: amd64-windows-bing-auto-reward-${{ github.ref_name }}
           - os: macos-latest
             target: aarch64-apple-darwin
             binary_name: bing-auto-reward
             archive_ext: tar.gz
+            archive_name: aarch64-macos-bing-auto-reward-${{ github.ref_name }}
 
     steps:
       - name: Checkout code
@@ -64,7 +77,7 @@ jobs:
             }
           }
           # 根据系统类型创建压缩包
-          $ARCHIVE_NAME = "bing-auto-reward-${{ github.ref_name }}-${{ matrix.target }}"
+          $ARCHIVE_NAME = "${{ matrix.archive_name }}-${{ matrix.target }}"
           Compress-Archive -Path "$PACKAGE_DIR\*" -DestinationPath "${ARCHIVE_NAME}.zip"
           echo "ASSET_PATH=${ARCHIVE_NAME}.zip" >> $env:GITHUB_ENV
 
@@ -92,7 +105,7 @@ jobs:
           done
 
           # 根据系统类型创建压缩包
-          ARCHIVE_NAME="bing-auto-reward-${{ github.ref_name }}-${{ matrix.target }}"
+          ARCHIVE_NAME="${{ matrix.archive_name }}-${{ matrix.target }}"
           if [ "${{ matrix.archive_ext }}" = "zip" ]; then
             (cd "$PACKAGE_DIR" && zip -r "../${ARCHIVE_NAME}.zip" .)
             echo "ASSET_PATH=${ARCHIVE_NAME}.zip" >> $GITHUB_ENV
