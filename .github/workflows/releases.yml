@@ -91,7 +91,7 @@ jobs:
             }
           }
           # 根据系统类型创建压缩包
-          $ARCHIVE_NAME = "${{ matrix.archive_name }}-${{ matrix.target }}"
+          $ARCHIVE_NAME = "${{ matrix.archive_name }}"
           Compress-Archive -Path "$PACKAGE_DIR\*" -DestinationPath "${ARCHIVE_NAME}.zip"
           echo "ASSET_PATH=${ARCHIVE_NAME}.zip" >> $env:GITHUB_ENV
 
@@ -119,7 +119,7 @@ jobs:
           done
 
           # 根据系统类型创建压缩包
-          ARCHIVE_NAME="${{ matrix.archive_name }}-${{ matrix.target }}"
+          ARCHIVE_NAME="${{ matrix.archive_name }}"
           if [ "${{ matrix.archive_ext }}" = "zip" ]; then
             (cd "$PACKAGE_DIR" && zip -r "../${ARCHIVE_NAME}.zip" .)
             echo "ASSET_PATH=${ARCHIVE_NAME}.zip" >> $GITHUB_ENV
