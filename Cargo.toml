@@ -1,6 +1,6 @@
 [package]
 name = "bing-auto-reward"
-version = "0.2.5"
+version = "0.2.6"
 edition = "2024"
 authors = ["dynamic-pigeon <3040313336@qq.com>"]
 license = "MIT"
