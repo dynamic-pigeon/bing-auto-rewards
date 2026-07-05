@@ -1,12 +1,41 @@
-# 一个自动获取 bing 积分的程序
+# Bing Auto Rewards
 
-**针对中国区域特调，没有适配其他区域，是否能够使用请自行斟酌**
+一个自动完成 Bing 搜索任务以获取 Microsoft Rewards 积分的工具。
 
-第一步，从 [release](https://github.com/dynamic-pigeon/bing-auto-rewards/releases/) 页面下载可执行文件，或者从源代码编译
+> **注意**：本程序针对中国区域特调，未适配其他区域，请根据实际情况自行判断能否使用。
 
-第二步你需要在本地安装一个谷歌浏览器（理论上 chromium 内核的浏览器都行，但是不保证兼容性）
+## 功能特性
 
-然后，你需要在根目录创建 `config.json`，格式大致如下：
+- 自动登录 Bing 账号
+- 自动完成 PC 端搜索任务
+- 自动点击 Rewards 每日任务和奖励卡片
+- 支持多账号并行处理
+- 支持定时任务调度
+- 支持本地持久化浏览器数据
+
+## 快速开始
+
+### 1. 获取程序
+
+从 [Releases](https://github.com/dynamic-pigeon/bing-auto-rewards/releases/) 页面下载对应平台的可执行文件，或者从源码编译：
+
+```bash
+git clone https://github.com/dynamic-pigeon/bing-auto-rewards.git
+cd bing-auto-rewards
+cargo build --release
+```
+
+编译完成的可执行文件位于 `target/release/bing-auto-reward`。
+
+### 2. 安装浏览器
+
+需要在本地安装一个基于 Chromium 内核的浏览器（例如 Google Chrome）。理论上其他 Chromium 内核浏览器也可使用，但不保证兼容性。
+
+如果浏览器不在系统 PATH 中，可通过配置项 `browser_path` 指定可执行文件路径。
+
+### 3. 创建配置文件
+
+在程序根目录创建 `config.json`，参考格式如下：
 
 ```json
 {
@@ -14,7 +43,7 @@
         {
             "email": "xxxx@qq.com",
             "password": "xxx",
-            "proxy": "http://proxy.excample.com:prot"
+            "proxy": "http://proxy.example.com:port"
         },
         {
             "email": "xxx@qq.com",
@@ -29,20 +58,51 @@
 }
 ```
 
-参数解释：
+### 4. 运行
 
-- accounts: 必填，账号列表
-  - email：必填，账号邮箱
-  - password：必填，密码
-  - proxy：可选，这个账号的代理服务器
-- max_threads：可选，同时进行积分处理的浏览器数量，默认 1
-- store_local：可选，是否把浏览器数据保存到本地，true 则保存到 ./user-data 目录下，默认 false，程序正常退出时会自动删除浏览器数据，保存在 ./tmp 文件夹
-- browser_path：可选，浏览器可执行路径，不填由程序自动寻找
-- schedule：可选，自动执行配置，[详细参数介绍](https://crates.io/crates/croner)，不填默认执行一次，注意，当这次执行的时候上次执行没有结束，这次执行会被跳过
-- user_data_cleanup_days：可选，仅在 `store_local=true` 时有意义。程序每次执行任务前会清理 `./user-data` 下超过该天数未使用的账号目录（根据目录中的 `.last_used` 记录判断）
+```bash
+./bing-auto-reward
+```
 
-## TODO：
+程序会自动读取当前目录下的 `config.json` 和 `log4rs.yaml`。
 
-- [ ] 更好的重试机制
-- [x] 定时任务
-- [x] 本地存储的时候能存储移动端的数据
+## 配置说明
+
+| 参数 | 必填 | 说明 |
+|------|------|------|
+| `accounts` | 是 | 账号列表，每个账号包含 `email`、`password`，可选 `proxy` |
+| `accounts[].email` | 是 | 账号邮箱 |
+| `accounts[].password` | 是 | 账号密码 |
+| `accounts[].proxy` | 否 | 该账号使用的代理服务器，例如 `http://proxy.example.com:8080` |
+| `max_threads` | 否 | 同时处理的浏览器实例数量，默认 `1` |
+| `store_local` | 否 | 是否将浏览器用户数据保存到本地。`true` 保存到 `./user-data`；`false` 使用临时目录，退出后自动清理，默认 `false` |
+| `browser_path` | 否 | 浏览器可执行文件路径，不填则尝试自动查找 |
+| `schedule` | 否 | Cron 表达式，用于定时执行，例如 `0 9 * * *` 表示每天 9 点。不填则只执行一次。详情参见 [croner](https://crates.io/crates/croner) |
+| `user_data_cleanup_days` | 否 | 仅在 `store_local=true` 时生效。程序每次执行任务前会清理 `./user-data` 下超过指定天数未使用的账号目录，根据目录中的 `.last_used` 记录判断 |
+
+## 注意事项
+
+- 请妥善保管 `config.json`，避免密码等敏感信息泄露。
+- 使用代理时，请确保代理服务器可正常访问 Bing 和 Microsoft 登录页面。
+- 定时任务模式下，程序会按 Cron 表达式顺序执行；若某次执行耗时较长，后续执行会顺延等待。
+- 若登录或搜索过程中出现异常，程序会自动截图保存到 `failed/` 目录以便排查。
+
+## 开发
+
+```bash
+# 检查
+cargo check
+
+# 格式化
+cargo fmt
+
+# 运行测试
+cargo test
+
+# 构建 release
+cargo build --release
+```
+
+## 许可证
+
+[MIT](./LICENSE)
