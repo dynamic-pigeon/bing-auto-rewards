@@ -64,7 +64,7 @@ cargo build --release
 ./bing-auto-reward
 ```
 
-程序会自动读取当前目录下的 `config.json` 和 `log4rs.yaml`。
+程序会自动读取当前目录下的 `config.json`。日志由 `tracing` 管理，默认同时输出到控制台和 `./log` 目录下的滚动日志文件（按天滚动，保留最近 7 天）。
 
 ## 配置说明
 
@@ -79,6 +79,16 @@ cargo build --release
 | `browser_path` | 否 | 浏览器可执行文件路径，不填则尝试自动查找 |
 | `schedule` | 否 | Cron 表达式，用于定时执行，例如 `0 9 * * *` 表示每天 9 点。不填则只执行一次。详情参见 [croner](https://crates.io/crates/croner) |
 | `user_data_cleanup_days` | 否 | 仅在 `store_local=true` 时生效。程序每次执行任务前会清理 `./user-data` 下超过指定天数未使用的账号目录，根据目录中的 `.last_used` 记录判断 |
+
+## 日志级别
+
+可通过环境变量 `RUST_LOG` 调整日志级别，例如：
+
+```bash
+RUST_LOG=info ./bing-auto-reward
+```
+
+默认级别为 `debug`，并对 `html5ever`、`selectors` 等冗余库设置为 `info`。支持的写法详见 [tracing-subscriber EnvFilter](https://docs.rs/tracing-subscriber/latest/tracing_subscriber/filter/struct.EnvFilter.html)。
 
 ## 注意事项
 

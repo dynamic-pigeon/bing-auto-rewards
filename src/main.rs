@@ -1,4 +1,5 @@
-use log::error;
+use tracing::error;
+use tracing_subscriber::{EnvFilter, fmt, prelude::*};
 
 use crate::bing::process;
 
@@ -7,7 +8,56 @@ mod hot_searches;
 mod random;
 
 fn main() {
-    let _ = log4rs::init_file("log4rs.yaml", Default::default())
-        .inspect_err(|_| println!("初始化日志配置文件失败"));
+    let _guard = init_tracing();
     let _ = process("config.json").inspect_err(|e| error!("{}", e));
+}
+
+fn init_tracing() -> tracing_appender::non_blocking::WorkerGuard {
+    let file_appender = tracing_appender::rolling::Builder::new()
+        .rotation(tracing_appender::rolling::Rotation::DAILY)
+        .filename_prefix("log")
+        .filename_suffix("log")
+        .max_log_files(7)
+        .build("log")
+        .expect("初始化文件日志失败");
+
+    let (non_blocking, guard) = tracing_appender::non_blocking(file_appender);
+
+    let env_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+        EnvFilter::new("debug")
+            .add_directive(
+                "html5ever=info"
+                    .parse()
+                    .expect("html5ever 过滤级别解析失败"),
+            )
+            .add_directive(
+                "selectors=info"
+                    .parse()
+                    .expect("selectors 过滤级别解析失败"),
+            )
+    });
+
+    tracing_subscriber::registry()
+        .with(env_filter)
+        .with(
+            fmt::layer()
+                .with_target(true)
+                .with_level(true)
+                .with_line_number(true)
+                .with_thread_ids(true)
+                .with_thread_names(true)
+                .with_ansi(false)
+                .with_writer(non_blocking),
+        )
+        .with(
+            fmt::layer()
+                .with_target(true)
+                .with_level(true)
+                .with_line_number(true)
+                .with_thread_ids(true)
+                .with_thread_names(true),
+        )
+        .init();
+
+    guard
 }

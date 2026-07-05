@@ -1,7 +1,7 @@
 use std::time::Duration;
 
 use anyhow::Result;
-use log::debug;
+use tracing::debug;
 
 /// 用于给返回 `anyhow::Result<T>` 的闭包添加重试能力，支持链式调用：
 pub trait Retryable<T> {

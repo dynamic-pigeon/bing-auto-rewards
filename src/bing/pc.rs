@@ -8,8 +8,8 @@ use std::{
 
 use anyhow::{Result, anyhow};
 use headless_chrome::{Browser, Tab};
-use log::{debug, info, warn};
 use rand::seq::IndexedRandom;
+use tracing::{debug, info, warn};
 
 use crate::{
     bing::{

@@ -4,14 +4,14 @@ use std::{
     path::Path,
     str::FromStr,
     sync::Arc,
-    thread::{sleep, spawn},
+    thread::{Builder, sleep},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
-use anyhow::Result;
+use anyhow::{Result, anyhow};
 use chrono::Local;
 use headless_chrome::{Browser, LaunchOptionsBuilder, Tab};
-use log::{error, info, warn};
+use tracing::{error, info, warn};
 
 use crate::{
     bing::{
@@ -115,9 +115,13 @@ fn process_once(config: Arc<Config>, pool: Arc<BrowserPool>) -> Result<()> {
         let account = account.clone();
         let config = Arc::clone(&config);
         let pool = Arc::clone(&pool);
-        let handle = spawn(move || {
-            process_account(account, config.as_ref(), Arc::clone(&pool));
-        });
+        let email = account.email.clone();
+        let handle = Builder::new()
+            .name(email.clone())
+            .spawn(move || {
+                process_account(account, config.as_ref(), Arc::clone(&pool));
+            })
+            .map_err(|e| anyhow!("创建账号 {} 的处理线程失败: {}", email, e))?;
         handles.push(handle);
     }
 

@@ -5,9 +5,9 @@ use std::{
 };
 
 use linkme::distributed_slice;
-use log::info;
 use rand::seq::IndexedRandom;
 use tokio::task::JoinSet;
+use tracing::info;
 
 mod common;
 
@@ -34,8 +34,8 @@ pub(crate) async fn fetch_hot_words() -> anyhow::Result<()> {
     while let Some(result) = join_set.join_next().await {
         match result {
             Ok(Ok(words)) => all_hot_words.extend(words),
-            Ok(Err(e)) => log::error!("获取热词失败: {}", e),
-            Err(e) => log::error!("获取热词任务异常: {}", e),
+            Ok(Err(e)) => tracing::error!("获取热词失败: {}", e),
+            Err(e) => tracing::error!("获取热词任务异常: {}", e),
         }
     }
 

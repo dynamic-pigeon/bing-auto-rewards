@@ -5,8 +5,8 @@ use std::{
 };
 
 use headless_chrome::Browser;
-use log::{debug, error};
 use parking_lot::{Condvar, Mutex};
+use tracing::{debug, error};
 
 /// 需要保证 temp_dir 的生命周期长于 browser
 #[derive(Default)]
