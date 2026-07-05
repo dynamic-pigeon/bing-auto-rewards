@@ -121,8 +121,20 @@ fn process_once(config: Arc<Config>, pool: Arc<BrowserPool>) -> Result<()> {
         handles.push(handle);
     }
 
+    let mut errors = 0;
     for handle in handles {
-        handle.join().unwrap();
+        if let Err(e) = handle.join() {
+            errors += 1;
+            let err = e
+                .downcast_ref::<String>()
+                .map(String::as_str)
+                .unwrap_or("未知错误");
+            error!("处理账号的线程发生错误：{}", err);
+        }
+    }
+
+    if errors > 0 {
+        anyhow::bail!("{} 个账号处理线程出现异常", errors);
     }
 
     Ok(())
@@ -178,10 +190,11 @@ fn cleanup_stale_user_data(retention_days: u64) -> Result<()> {
 
 fn read_last_cleanup_time(root: &Path) -> Result<SystemTime> {
     let marker = root.join(LAST_CLEANUP_MARKER);
-    if marker.exists() {
+    if marker.is_file() {
         let content = fs::read_to_string(&marker)?;
-        if let Ok(ts) = content.trim().parse::<u64>() {
-            return Ok(UNIX_EPOCH + Duration::from_secs(ts));
+        match content.trim().parse::<u64>() {
+            Ok(ts) => return Ok(UNIX_EPOCH + Duration::from_secs(ts)),
+            Err(e) => warn!("清理时间戳解析失败（{}），将视为首次清理", e),
         }
     }
 
@@ -230,7 +243,7 @@ fn get_today_rewards(tab: &Tab) -> Result<String> {
     ele.get_inner_text()
 }
 
-fn shot_when_faild(tab: &Tab, prefix: &str, account: &str) {
+fn shot_when_failed(tab: &Tab, prefix: &str, account: &str) {
     if let Ok(png) = tab.capture_screenshot(
         headless_chrome::protocol::cdp::Page::CaptureScreenshotFormatOption::Png,
         None,

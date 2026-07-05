@@ -35,7 +35,7 @@ pub(crate) async fn fetch_hot_words() -> anyhow::Result<()> {
         match result {
             Ok(Ok(words)) => all_hot_words.extend(words),
             Ok(Err(e)) => log::error!("获取热词失败: {}", e),
-            Err(e) => log::error!("获取热词失败: {}", e),
+            Err(e) => log::error!("获取热词任务异常: {}", e),
         }
     }
 
@@ -59,6 +59,7 @@ fn modify_hot_words(mut words: Vec<String>) -> Vec<String> {
     words
 }
 
+#[cfg(test)]
 mod test {
     #[tokio::test]
     async fn test_fetch_hot_words() {

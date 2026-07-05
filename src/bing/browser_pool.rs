@@ -1,6 +1,5 @@
 use std::{
     ops::{Deref, DerefMut},
-    sync::Arc,
     thread::sleep,
     time::Duration,
 };
@@ -39,7 +38,6 @@ impl Drop for BingBot {
 pub(crate) struct BrowserPool {
     cond: Condvar,
     pool: Mutex<Vec<BingBot>>,
-    mutex: Arc<Mutex<()>>,
 }
 
 pub(crate) struct PoolWrapper<'a> {
@@ -62,25 +60,20 @@ impl<'a> DerefMut for PoolWrapper<'a> {
 
 impl<'a> Drop for PoolWrapper<'a> {
     fn drop(&mut self) {
-        if let Some(mut bot) = self.bot.take() {
-            debug!("归还浏览器实例到浏览器池：{}", bot.account);
-            // 先丢弃浏览器实例
-            bot.browser.take();
-            if let Some(t) = bot.temp_dir.take() {
-                sleep(Duration::from_secs(3));
-                drop(t);
-            }
-            {
-                let mut pool = self.pool.pool.lock();
-                pool.push(bot);
-            }
-
-            self.pool.cond.notify_one();
-        } else {
+        let Some(mut bot) = self.bot.take() else {
             error!("浏览器池中的浏览器实例丢失！");
-            self.pool.pool.lock().push(BingBot::default());
             self.pool.cond.notify_one();
+            return;
+        };
+
+        debug!("归还浏览器实例到浏览器池：{}", bot.account);
+        bot.browser.take();
+        if let Some(t) = bot.temp_dir.take() {
+            sleep(Duration::from_secs(3));
+            drop(t);
         }
+        self.pool.pool.lock().push(bot);
+        self.pool.cond.notify_one();
     }
 }
 
@@ -95,16 +88,10 @@ impl BrowserPool {
                 }
                 v
             }),
-            mutex: Arc::new(Mutex::new(())),
         }
     }
 
     pub(crate) fn get_bot<'a>(&'a self) -> PoolWrapper<'a> {
-        let guard = self.mutex.lock_arc();
-        std::thread::spawn(move || {
-            sleep(Duration::from_secs(10));
-            drop(guard);
-        });
         let mut pool = self.pool.lock();
         loop {
             if let Some(bot) = pool.pop() {

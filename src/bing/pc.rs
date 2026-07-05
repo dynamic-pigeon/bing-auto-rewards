@@ -14,7 +14,7 @@ use rand::seq::IndexedRandom;
 use crate::{
     bing::{
         BING_URL, BingBot, GAP_NUM, GAP_RANGE, REWARDS_URL, REWARDS_URL_DS, SLEEP_RANGE, close_tab,
-        default_options_builder, get_one_tab, retry::Retryable, shot_when_faild,
+        default_options_builder, get_one_tab, retry::Retryable, shot_when_failed,
     },
     random::ExpectedNTrigger,
 };
@@ -30,30 +30,20 @@ impl BingBot {
         browser_path: &Option<String>,
         proxy: &Option<String>,
     ) -> Result<()> {
-        let temp_dir = None;
+        self.close_browser();
 
-        let user_dir = if store_local {
-            std::fs::create_dir_all("./user-data")?;
-            let user_data_dir = std::path::PathBuf::from(format!("./user-data/pc_{}", account));
-            std::fs::create_dir_all(&user_data_dir)?;
-            mark_user_data_last_used(&user_data_dir)?;
-            Some(user_data_dir)
+        let (temp_dir, user_dir) = if store_local {
+            (None, Some(prepare_local_user_data_dir(account)?))
         } else {
             std::fs::create_dir_all("./tmp")?;
             let dir = tempfile::TempDir::new_in("./tmp")?;
-            Some(dir.path().to_path_buf())
+            let path = dir.path().to_path_buf();
+            (Some(dir), Some(path))
         };
-        let options = default_options_builder(vec![OsStr::new(const_format::formatcp!(
-            "--user-agent='{}'",
-            PC_USER_AGENT
-        ))])
-        .path(browser_path.as_deref().map(PathBuf::from))
-        .user_data_dir(user_dir)
-        .window_size(Some((1920, 1080)))
-        .proxy_server(proxy.as_deref())
-        .build()?;
 
+        let options = build_pc_options(browser_path, proxy, user_dir)?;
         let browser = Browser::new(options)?;
+
         self.browser = Some(browser);
         self.temp_dir = temp_dir;
         self.store_local = store_local;
@@ -64,32 +54,59 @@ impl BingBot {
     }
 
     pub(crate) fn restart_pc_browser(&mut self) -> Result<()> {
-        self.browser.take();
-        let user_dir = if self.store_local {
-            std::fs::create_dir_all("./user-data")?;
-            let user_data_dir =
-                std::path::PathBuf::from(format!("./user-data/pc_{}", self.account));
-            std::fs::create_dir_all(&user_data_dir)?;
-            mark_user_data_last_used(&user_data_dir)?;
-            Some(user_data_dir)
+        self.close_browser();
+
+        let (temp_dir, user_dir) = if self.store_local {
+            (None, Some(prepare_local_user_data_dir(&self.account)?))
         } else {
-            Some(self.temp_dir.as_ref().unwrap().path().to_path_buf())
+            let dir = match self.temp_dir.take() {
+                Some(dir) => dir,
+                None => {
+                    std::fs::create_dir_all("./tmp")?;
+                    tempfile::TempDir::new_in("./tmp")?
+                }
+            };
+            let path = dir.path().to_path_buf();
+            (Some(dir), Some(path))
         };
-        let options = default_options_builder(vec![OsStr::new(const_format::formatcp!(
-            "--user-agent='{}'",
-            PC_USER_AGENT
-        ))])
-        .path(self.browser_path.as_deref().map(PathBuf::from))
-        .user_data_dir(user_dir)
-        .window_size(Some((1920, 1080)))
-        .proxy_server(self.proxy.as_deref())
-        .build()?;
+
+        let options = build_pc_options(&self.browser_path, &self.proxy, user_dir)?;
         let browser = Browser::new(options)?;
 
         self.browser = Some(browser);
+        self.temp_dir = temp_dir;
         debug!("浏览器重启完成");
         Ok(())
     }
+
+    fn close_browser(&mut self) {
+        self.browser.take();
+    }
+}
+
+fn build_pc_options<'a>(
+    browser_path: &'a Option<String>,
+    proxy: &'a Option<String>,
+    user_dir: Option<PathBuf>,
+) -> Result<headless_chrome::LaunchOptions<'a>> {
+    default_options_builder(vec![OsStr::new(const_format::formatcp!(
+        "--user-agent='{}'",
+        PC_USER_AGENT
+    ))])
+    .path(browser_path.as_deref().map(PathBuf::from))
+    .user_data_dir(user_dir)
+    .window_size(Some((1920, 1080)))
+    .proxy_server(proxy.as_deref())
+    .build()
+    .map_err(|e| anyhow!("构建浏览器启动选项失败：{}", e))
+}
+
+fn prepare_local_user_data_dir(account: &str) -> Result<PathBuf> {
+    std::fs::create_dir_all("./user-data")?;
+    let user_data_dir = std::path::PathBuf::from(format!("./user-data/pc_{}", account));
+    std::fs::create_dir_all(&user_data_dir)?;
+    mark_user_data_last_used(&user_data_dir)?;
+    Ok(user_data_dir)
 }
 
 fn mark_user_data_last_used(user_data_dir: &Path) -> Result<()> {
@@ -128,21 +145,21 @@ pub(crate) fn process_account(
     })
     .retry(3)
     .inspect_err(|_| {
-        shot_when_faild(&tab, "login", email);
+        shot_when_failed(&tab, "login", email);
     })?;
 
     sleep(Duration::from_secs(5));
 
     info!("开始尝试点击卡片");
     let _ = click_rewards(browser, &tab).inspect_err(|_| {
-        shot_when_faild(&tab, "click_rewards", email);
+        shot_when_failed(&tab, "click_rewards", email);
     });
 
     sleep(Duration::from_secs(5));
 
     info!("开始进行搜索任务");
     search(browser_bot, email, &mut tab).inspect_err(|_| {
-        shot_when_faild(&tab, "search", email);
+        shot_when_failed(&tab, "search", email);
     })?;
 
     info!("{} 账号处理完成", email);
@@ -166,7 +183,7 @@ fn search(browser_bot: &mut BingBot, email: &str, tab: &mut Arc<Tab>) -> Result<
                     }
                 }
                 Err(e) => {
-                    shot_when_faild(tab, "rewards_get_failed", email);
+                    shot_when_failed(tab, "rewards_get_failed", email);
                     warn!("获取账号 {email} 积分详情失败: {e}");
                 }
             }
@@ -198,11 +215,12 @@ fn search(browser_bot: &mut BingBot, email: &str, tab: &mut Arc<Tab>) -> Result<
 
         (|| {
             perform_search_and_click(browser_bot.get_browser()?, tab, &word).inspect_err(|_| {
-                if let Ok(_) = browser_bot.restart_pc_browser()
-                    && let Ok(new_tab) = get_one_tab(browser_bot.get_browser().expect("怎么回事呢"))
-                {
+                let _ = (|| -> Result<()> {
+                    browser_bot.restart_pc_browser()?;
+                    let new_tab = get_one_tab(browser_bot.get_browser()?)?;
                     *tab = new_tab;
-                }
+                    Ok(())
+                })();
             })?;
             info!("第 {} 次搜索完成", i + 1);
             Ok(())
@@ -216,10 +234,11 @@ fn search(browser_bot: &mut BingBot, email: &str, tab: &mut Arc<Tab>) -> Result<
 fn perform_search_and_click(browser: &mut Browser, tab: &Tab, word: &str) -> Result<()> {
     let before_tabs = browser.get_tabs().lock().unwrap().clone();
 
-    tab.navigate_to(&format!(
-        "https://cn.bing.com/search?q={}&PC=U316&FORM=CHROMN",
-        word
-    ))?;
+    let search_url = reqwest::Url::parse_with_params(
+        "https://cn.bing.com/search",
+        [("q", word), ("PC", "U316"), ("FORM", "CHROMN")],
+    )?;
+    tab.navigate_to(search_url.as_str())?;
 
     sleep(Duration::from_secs(rand::random_range(1..4)));
 
@@ -353,7 +372,7 @@ pub(super) fn login_bing(email: &str, password: &str, tab: &Tab) -> Result<()> {
         match tab.wait_for_xpath_with_custom_timeout(
             concat!(
                 "//input[@type='password' or @name='passwd']",
-                "|input[@id='passwordInput']",
+                "|//input[@id='passwordInput']",
             ),
             Duration::from_secs(5),
         ) {
@@ -408,7 +427,7 @@ pub(super) fn login_bing(email: &str, password: &str, tab: &Tab) -> Result<()> {
     info!("登录按钮点击成功");
 
     if let Ok(_) = tab.wait_for_xpath_with_custom_timeout(
-        "//*[contains(text(), '保持登录状态')]|//[*contains(text(), 'Stay signed in')]",
+        "//*[contains(text(), '保持登录状态')]|//*[contains(text(), 'Stay signed in')]",
         Duration::from_secs(5),
     ) && let Ok(ok_button) =
         tab.find_element_by_xpath(concat!("//button[text()='是']", "|//button[text()='Yes']",))

@@ -41,10 +41,10 @@ impl JsonPathExtractor {
 
         match &remaining_steps[0] {
             PathStep::Key(key) => {
-                if let Value::Object(mut obj) = value {
-                    if let Some(next_value) = obj.remove(key) {
-                        return self.extract_recursive(next_value, &remaining_steps[1..]);
-                    }
+                if let Value::Object(mut obj) = value
+                    && let Some(next_value) = obj.remove(key)
+                {
+                    return self.extract_recursive(next_value, &remaining_steps[1..]);
                 }
                 vec![]
             }
