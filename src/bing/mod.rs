@@ -1,5 +1,4 @@
 use std::{
-    ffi::OsStr,
     fs,
     path::Path,
     str::FromStr,
@@ -10,7 +9,9 @@ use std::{
 
 use anyhow::{Result, anyhow};
 use chrono::Local;
-use headless_chrome::{Browser, LaunchOptionsBuilder, Tab};
+use chromiumoxide::browser::{Browser, BrowserConfig};
+use chromiumoxide::page::{Page, ScreenshotParams};
+use chromiumoxide_cdp::cdp::browser_protocol::page::CaptureScreenshotFormat;
 use tracing::{error, info, warn};
 
 use crate::{
@@ -234,26 +235,92 @@ fn process_account(
     .inspect_err(|e| error!("处理账号 {} 失败: {}", account.email, e));
 }
 
-#[allow(dead_code)]
-fn get_today_rewards(tab: &Tab) -> Result<String> {
-    tab.navigate_to(REWARDS_URL)?;
-    tab.wait_until_navigated()?;
+fn default_browser_config(
+    args: Vec<String>,
+    browser_path: &Option<String>,
+    user_dir: Option<std::path::PathBuf>,
+    proxy: &Option<String>,
+) -> Result<BrowserConfig> {
+    let mut config = BrowserConfig::builder();
+    if !HEADLESS {
+        config = config.with_head();
+    }
+    config = config.no_sandbox();
+    config = config.window_size(1920, 1080);
+    if let Some(path) = browser_path {
+        config = config.chrome_executable(std::path::PathBuf::from(path));
+    }
+    if let Some(dir) = user_dir {
+        config = config.user_data_dir(dir);
+    }
 
-    let ele = tab.wait_for_xpath_with_custom_timeout(
-        "//*[@id='dailypointToolTipDiv']/p/mee-rewards-counter-animation/span",
-        Duration::from_secs(5),
-    )?;
+    let mut chrome_args = vec![
+        "--disable-dev-shm-usage".to_string(),
+        "--disable-extensions".to_string(),
+        "--disable-blink-features=AutomationControlled".to_string(),
+        "--allow-running-insecure-content".to_string(),
+        "--disable-plugins".to_string(),
+        "--disable-images".to_string(),
+        "--disable-web-security".to_string(),
+        "--mute-audio".to_string(),
+        "--no-first-run".to_string(),
+        "--no-default-browser-check".to_string(),
+    ];
+    chrome_args.extend(args);
 
-    ele.get_inner_text()
+    if let Some(proxy) = proxy {
+        chrome_args.push("--proxy-server".to_string());
+        chrome_args.push(proxy.clone());
+    }
+
+    config = config.args(chrome_args);
+
+    config
+        .build()
+        .map_err(|e| anyhow!("构建浏览器启动选项失败：{}", e))
 }
 
-fn shot_when_failed(tab: &Tab, prefix: &str, account: &str) {
-    if let Ok(png) = tab.capture_screenshot(
-        headless_chrome::protocol::cdp::Page::CaptureScreenshotFormatOption::Png,
-        None,
-        None,
-        true,
-    ) {
+fn get_one_page(browser: &Browser, runtime: &tokio::runtime::Runtime) -> Result<Page> {
+    let pages = runtime.block_on(browser.pages())?;
+    if let Some(page) = pages.into_iter().next() {
+        Ok(page)
+    } else {
+        runtime
+            .block_on(browser.new_page("about:blank"))
+            .map_err(|e| anyhow!("创建新页面失败：{}", e))
+    }
+}
+
+fn close_tab(
+    before_pages: Vec<Page>,
+    browser: &Browser,
+    runtime: &tokio::runtime::Runtime,
+) -> Result<()> {
+    let after_pages = runtime.block_on(browser.pages())?;
+    for page in after_pages {
+        let target_id = page.target_id();
+        if !before_pages
+            .iter()
+            .any(|p| p.target_id() == target_id)
+        {
+            info!("发现新打开的标签页，准备关闭");
+            runtime.block_on(page.close())?;
+            info!("标签页关闭成功");
+        }
+    }
+    Ok(())
+}
+
+fn shot_when_failed(
+    page: &Page,
+    runtime: &tokio::runtime::Runtime,
+    prefix: &str,
+    account: &str,
+) {
+    let params = ScreenshotParams::builder()
+        .format(CaptureScreenshotFormat::Png)
+        .build();
+    if let Ok(png) = runtime.block_on(page.screenshot(params)) {
         std::fs::create_dir_all("failed").ok();
         let file_name = format!("{prefix}_failure_{account}.png");
         if let Err(e) = std::fs::write(Path::new("failed").join(&file_name), &png) {
@@ -262,61 +329,4 @@ fn shot_when_failed(tab: &Tab, prefix: &str, account: &str) {
             info!("失败截图已保存为 {file_name}");
         }
     }
-}
-
-fn close_tab(before_tabs: Vec<Arc<Tab>>, browser: &mut Browser) -> Result<()> {
-    let after_tabs = browser.get_tabs().lock().unwrap().clone();
-    // 就两三个 tab，直接遍历关闭
-    for tab in after_tabs.iter() {
-        if !before_tabs
-            .iter()
-            .any(|t| t.get_target_id() == tab.get_target_id())
-        {
-            info!("发现新打开的标签页，准备关闭");
-            tab.close(false)?;
-            info!("标签页关闭成功");
-        }
-    }
-    Ok(())
-}
-
-fn get_one_tab(browser: &mut Browser) -> Result<Arc<Tab>> {
-    let tabs = browser.get_tabs().lock().unwrap();
-    if !tabs.is_empty() {
-        tabs[0].set_default_timeout(Duration::from_secs(25));
-        Ok(tabs[0].clone())
-    } else {
-        drop(tabs);
-        let tab = browser.new_tab()?;
-        tab.set_default_timeout(Duration::from_secs(25));
-        Ok(tab)
-    }
-}
-
-fn default_options_builder<'a>(args: Vec<&'a OsStr>) -> LaunchOptionsBuilder<'a> {
-    let mut options = LaunchOptionsBuilder::default();
-    options
-        .headless(HEADLESS)
-        .enable_gpu(false)
-        .idle_browser_timeout(Duration::from_mins(30))
-        .sandbox(false)
-        .args(
-            [
-                "--disable-dev-shm-usage",
-                "--disable-extensions",
-                "--disable-blink-features=AutomationControlled",
-                "--allow-running-insecure-content",
-                "--disable-plugins",
-                "--disable-images",
-                "--disable-web-security",
-                "--mute-audio",
-                "--no-first-run",
-                "--no-default-browser-check",
-            ]
-            .into_iter()
-            .map(std::ffi::OsStr::new)
-            .chain(args)
-            .collect(),
-        );
-    options
 }

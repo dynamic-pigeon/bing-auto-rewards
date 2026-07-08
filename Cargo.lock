@@ -89,6 +89,7 @@ version = "0.2.7"
 dependencies = [
  "anyhow",
  "chromiumoxide",
+ "chromiumoxide_cdp",
  "chrono",
  "const_format",
  "croner",

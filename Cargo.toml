@@ -7,6 +7,7 @@ license = "MIT"
 
 [dependencies]
 chromiumoxide = "0.9"
+chromiumoxide_cdp = "0.9"
 futures = "0.3"
 tempfile = "3.3"
 tracing = "0.1"
