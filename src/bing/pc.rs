@@ -5,6 +5,7 @@ use std::{
 
 use anyhow::{Result, anyhow};
 use chromiumoxide::browser::Browser;
+use chromiumoxide::element::Element;
 use chromiumoxide::page::Page;
 use futures::StreamExt;
 use rand::seq::IndexedRandom;
@@ -335,29 +336,47 @@ async fn click_rewards(browser: &Browser, page: &Page) -> Result<()> {
     Ok(())
 }
 
+/// 轮询等待页面中匹配选择器的元素出现（至少一个）。
+///
+/// 页面动态渲染时，容器可能在 DOMContentLoaded 后就存在，但子元素会延迟填充。
+/// chromiumoxide 的 `find_elements` 只执行一次查询，不会主动等待，因此需要手动轮询。
+async fn wait_for_elements(page: &Page, selector: &str, timeout: Duration) -> Result<Vec<Element>> {
+    let start = std::time::Instant::now();
+    loop {
+        match page.find_elements(selector).await {
+            Ok(elements) if !elements.is_empty() => return Ok(elements),
+            _ => {
+                if start.elapsed() >= timeout {
+                    anyhow::bail!("等待选择器 {} 的元素超时", selector);
+                }
+                tokio::time::sleep(Duration::from_millis(200)).await;
+            }
+        }
+    }
+}
+
 async fn click_earn(browser: &Browser, page: &Page) -> Result<()> {
     page.goto(REWARDS_URL).await?;
     page.wait_for_navigation().await?;
 
-    let ele = tokio::time::timeout(
+    let cards = wait_for_elements(
+        page,
+        "#moreactivities > div > div:nth-of-type(2) a",
         Duration::from_secs(25),
-        page.find_element("#moreactivities > div > div:nth-of-type(2)"),
     )
-    .await
-    .map_err(|_| anyhow!("等待奖励卡片超时"))??;
-    let ele = ele.find_elements("a").await?;
-    info!("找到 {} 个奖励卡片，准备点击", ele.len());
+    .await?;
+    info!("找到 {} 个奖励卡片，准备点击", cards.len());
 
-    for card in ele {
+    for card in cards {
         let text = card.inner_text().await?.unwrap_or_default();
         if !text.contains("+") {
             continue;
         }
 
         let before_pages = browser.pages().await?;
-        match card.click().await {
-            Ok(_) => info!("点击奖励卡片成功"),
-            Err(e) => warn!("点击奖励卡片失败：{}", e),
+        match card.call_js_fn("function() { this.click(); }", false).await {
+            Ok(_) => info!("通过 JS 点击奖励卡片成功"),
+            Err(e) => warn!("通过 JS 点击奖励卡片失败：{}", e),
         }
         tokio::time::sleep(Duration::from_secs(5)).await;
         let _ = close_tab(before_pages, browser).await;
@@ -370,20 +389,20 @@ async fn click_earn(browser: &Browser, page: &Page) -> Result<()> {
 async fn click_daily_set(browser: &Browser, page: &Page) -> Result<()> {
     page.goto(REWARDS_URL_DS).await?;
     page.wait_for_navigation().await?;
-    let ele = tokio::time::timeout(
-        Duration::from_secs(25),
-        page.find_element("#dailyset > div > div:nth-of-type(2)"),
-    )
-    .await
-    .map_err(|_| anyhow!("等待每日任务卡片超时"))??;
-    let ele = ele.find_elements("a").await?;
-    info!("找到 {} 个每日任务卡片，准备点击", ele.len());
 
-    for card in ele {
+    let cards = wait_for_elements(
+        page,
+        "#dailyset > div > div:nth-of-type(2) a",
+        Duration::from_secs(25),
+    )
+    .await?;
+    info!("找到 {} 个每日任务卡片，准备点击", cards.len());
+
+    for card in cards {
         let before_pages = browser.pages().await?;
-        match card.click().await {
-            Ok(_) => info!("点击每日任务卡片成功"),
-            Err(e) => warn!("点击每日任务卡片失败：{}", e),
+        match card.call_js_fn("function() { this.click(); }", false).await {
+            Ok(_) => info!("通过 JS 点击每日任务卡片成功"),
+            Err(e) => warn!("通过 JS 点击每日任务卡片失败：{}", e),
         }
         tokio::time::sleep(Duration::from_secs(5)).await;
         let _ = close_tab(before_pages, browser).await;
