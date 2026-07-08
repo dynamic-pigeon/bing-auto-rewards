@@ -33,6 +33,10 @@ impl BingBot {
 
         let (temp_dir, user_dir) = if store_local {
             (None, Some(prepare_local_user_data_dir(account)?))
+        } else if let Some(dir) = self.temp_dir.take() {
+            // 重启时复用同一个临时 profile，保留 cookie
+            let path = dir.path().to_path_buf();
+            (Some(dir), Some(path))
         } else {
             std::fs::create_dir_all("./tmp")?;
             let dir = tempfile::TempDir::new_in("./tmp")?;
@@ -617,19 +621,29 @@ async fn click_login_button(page: &Page) -> Result<()> {
 async fn get_pc_search_process(page: &Page) -> Result<(u32, u32)> {
     page.goto("https://rewards.bing.com/earn").await?;
     let _ = page.wait_for_navigation().await;
-    let ele = page
-        .find_element("#shell > div.grow > div > main > div")
-        .await?;
-    let button = ele.find_element("button").await?;
-    button.click().await?;
     tokio::time::sleep(Duration::from_secs(3)).await;
-    let ele = page
-        .find_xpath("/html/body/div[3]/div/section/div/div[2]/div/div[1]/div[2]/div[4]")
-        .await?;
-    let text = ele.inner_text().await?.unwrap_or_default();
 
-    let (cur_points, max_points) = parse_point(&text)?;
-    Ok((cur_points, max_points))
+    // 新版 Rewards 页面直接在卡片里展示进度，例如 "搜索: 0/1"
+    let progress: Option<String> = page
+        .evaluate(
+            r#"(() => {
+                const cards = Array.from(document.querySelectorAll('main *'));
+                const card = cards.find(el => el.textContent.includes('必应搜索连续打卡'));
+                if (!card) return null;
+                let node = card;
+                for (let i = 0; i < 6 && node; i++) {
+                    const m = node.textContent.match(/搜索[:：]\s*(\d+)\s*\/\s*(\d+)/);
+                    if (m) return `${m[1]}/${m[2]}`;
+                    node = node.parentElement;
+                }
+                return null;
+            })()"#,
+        )
+        .await?
+        .into_value()?;
+
+    let text = progress.ok_or(anyhow!("未找到 PC 搜索进度"))?;
+    parse_point(&text)
 }
 
 fn parse_point(text: &str) -> Result<(u32, u32)> {
