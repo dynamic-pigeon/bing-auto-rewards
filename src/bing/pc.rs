@@ -55,6 +55,9 @@ impl BingBot {
         });
 
         let page = get_one_page(&browser).await?;
+        page.enable_stealth_mode_with_agent(PC_USER_AGENT)
+            .await
+            .map_err(|e| anyhow!("启用反检测模式失败：{}", e))?;
 
         self.browser = Some(browser);
         self.page = Some(page);
@@ -83,12 +86,7 @@ fn build_pc_config(
     proxy: &Option<String>,
     user_dir: Option<PathBuf>,
 ) -> Result<chromiumoxide::browser::BrowserConfig> {
-    default_browser_config(
-        vec![format!("--user-agent='{}'", PC_USER_AGENT)],
-        browser_path,
-        user_dir,
-        proxy,
-    )
+    default_browser_config(vec![], browser_path, user_dir, proxy)
 }
 
 fn prepare_local_user_data_dir(account: &str) -> Result<PathBuf> {
