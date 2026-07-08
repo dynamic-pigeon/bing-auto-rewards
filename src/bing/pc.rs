@@ -575,6 +575,7 @@ pub(super) async fn check_login_status(page: &Page) -> Result<bool> {
 }
 
 async fn click_login_button(page: &Page) -> Result<()> {
+    // 新版 Bing 首页可能不显示登录入口，优先在搜索结果页头部寻找
     let login_button = tokio::time::timeout(
         Duration::from_secs(10),
         page.find_xpath(concat!(
@@ -589,8 +590,24 @@ async fn click_login_button(page: &Page) -> Result<()> {
             "|//button[contains(text(), '登录') or contains(text(), 'Sign in') or contains(text(), '登入')]",
         )),
     )
-    .await
-    .map_err(|_| anyhow!("等待登录按钮超时"))??;
+    .await;
+
+    let login_button = match login_button {
+        Ok(Ok(btn)) => btn,
+        _ => {
+            info!("首页未找到登录按钮，尝试从搜索结果页登录");
+            page.goto("https://cn.bing.com/search?q=bing").await?;
+            page.wait_for_navigation().await?;
+            tokio::time::timeout(
+                Duration::from_secs(10),
+                page.find_xpath(
+                    "//header//a[contains(text(), '登录') or contains(text(), 'Sign in')]",
+                ),
+            )
+            .await
+            .map_err(|_| anyhow!("等待登录按钮超时"))??
+        }
+    };
 
     info!("找到登录按钮，准备点击");
     tokio::time::sleep(Duration::from_secs(2)).await;

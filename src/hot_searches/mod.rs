@@ -46,13 +46,6 @@ pub(crate) async fn fetch_hot_words() -> anyhow::Result<()> {
     Ok(())
 }
 
-pub(crate) fn fetch_hot_words_blocking() -> anyhow::Result<()> {
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()?;
-    runtime.block_on(fetch_hot_words())
-}
-
 fn modify_hot_words(mut words: Vec<String>) -> Vec<String> {
     words.sort_unstable();
     words.dedup();
