@@ -48,7 +48,7 @@ impl Drop for BingBot {
         self.page.take();
 
         // 在 Drop 中无法 await，尽量异步关闭浏览器并释放资源，避免阻塞 tokio worker。
-        let _ = tokio::spawn(async move {
+        let _handle = tokio::spawn(async move {
             if let (Some(mut browser), Some(task)) = (browser, task) {
                 let _ = browser.close().await;
                 task.abort();
