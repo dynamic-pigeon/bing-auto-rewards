@@ -1,7 +1,5 @@
 use std::{
     ops::{Deref, DerefMut},
-    thread::sleep,
-    time::Duration,
 };
 
 use anyhow::anyhow;
@@ -44,19 +42,20 @@ impl BingBot {
 
 impl Drop for BingBot {
     fn drop(&mut self) {
-        if let (Some(mut browser), Some(task)) =
-            (self.browser.take(), self.handler_task.take())
-        {
-            tokio::spawn(async move {
+        let browser = self.browser.take();
+        let task = self.handler_task.take();
+        let temp_dir = self.temp_dir.take();
+        self.page.take();
+
+        // 在 Drop 中无法 await，尽量异步关闭浏览器并释放资源，避免阻塞 tokio worker。
+        let _ = tokio::spawn(async move {
+            if let (Some(mut browser), Some(task)) = (browser, task) {
                 let _ = browser.close().await;
                 task.abort();
-            });
-        }
-        self.page.take();
-        if let Some(dir) = self.temp_dir.take() {
-            sleep(Duration::from_secs(3));
-            drop(dir);
-        }
+            }
+            // 浏览器关闭后再释放临时 profile 目录，避免文件仍被占用。
+            drop(temp_dir);
+        });
     }
 }
 

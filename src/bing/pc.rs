@@ -7,6 +7,7 @@ use anyhow::{Result, anyhow};
 use chromiumoxide::browser::Browser;
 use chromiumoxide::element::Element;
 use chromiumoxide::page::Page;
+use chromiumoxide_cdp::cdp::browser_protocol::page::ReloadParams;
 use futures::StreamExt;
 use rand::seq::IndexedRandom;
 use tracing::{debug, info, warn};
@@ -264,19 +265,11 @@ async fn perform_search_and_click(browser: &Browser, page: &Page, word: &str) ->
 
     tokio::time::sleep(Duration::from_secs(rand::random_range(1..4))).await;
 
-    let search_res = tokio::time::timeout(Duration::from_secs(25), page.find_element("#b_results"))
+    wait_for_element(page, "#b_results li.b_algo", Duration::from_secs(25))
         .await
-        .map_err(|_| anyhow!("等待搜索结果超时"))??;
+        .map_err(|e| anyhow!("等待搜索结果超时：{e}"))?;
 
-    tokio::time::timeout(
-        Duration::from_secs(25),
-        search_res.find_element("li.b_algo"),
-    )
-    .await
-    .map_err(|_| anyhow!("查找搜索结果超时"))?
-    .map_err(|e| anyhow!(format!("没有找到搜索结果：{e}")))?;
-
-    let all_res = page.find_elements("li.b_algo").await?;
+    let all_res = wait_for_elements(page, "#b_results li.b_algo", Duration::from_secs(25)).await?;
 
     let ele = all_res
         .choose(&mut rand::rng())
@@ -334,6 +327,49 @@ async fn click_rewards(browser: &Browser, page: &Page) -> Result<()> {
 
     info!("卡片点击完成");
     Ok(())
+}
+
+/// 强制刷新页面（忽略缓存），恢复 headless_chrome 中 `tab.reload(true, None)` 的语义。
+async fn reload_hard(page: &Page) -> Result<()> {
+    let params = ReloadParams::builder().ignore_cache(true).build();
+    page.execute(params).await?;
+    page.wait_for_navigation().await?;
+    Ok(())
+}
+
+/// 轮询等待页面中匹配 CSS 选择器的单个元素出现。
+///
+/// `chromiumoxide` 的 `find_element` 只执行一次查询；原 `headless_chrome` 的
+/// `wait_for_element` 会轮询 DOM 直到超时。本函数恢复原有语义。
+async fn wait_for_element(page: &Page, selector: &str, timeout: Duration) -> Result<Element> {
+    let start = std::time::Instant::now();
+    loop {
+        match page.find_element(selector).await {
+            Ok(ele) => return Ok(ele),
+            _ => {
+                if start.elapsed() >= timeout {
+                    anyhow::bail!("等待选择器 {} 的元素超时", selector);
+                }
+                tokio::time::sleep(Duration::from_millis(200)).await;
+            }
+        }
+    }
+}
+
+/// 轮询等待页面中匹配 XPath 的单个元素出现。
+async fn wait_for_xpath(page: &Page, xpath: &str, timeout: Duration) -> Result<Element> {
+    let start = std::time::Instant::now();
+    loop {
+        match page.find_xpath(xpath).await {
+            Ok(ele) => return Ok(ele),
+            _ => {
+                if start.elapsed() >= timeout {
+                    anyhow::bail!("等待 XPath {} 的元素超时", xpath);
+                }
+                tokio::time::sleep(Duration::from_millis(200)).await;
+            }
+        }
+    }
 }
 
 /// 轮询等待页面中匹配选择器的元素出现（至少一个）。
@@ -416,8 +452,7 @@ pub(super) async fn login_bing(email: &str, password: &str, page: &Page) -> Resu
     page.activate().await?;
     page.goto(BING_URL).await?;
     page.wait_for_navigation().await?;
-    page.reload().await?;
-    page.wait_for_navigation().await?;
+    reload_hard(page).await?;
 
     let mut click_last_err: Option<anyhow::Error> = None;
     for i in 0..3 {
@@ -448,78 +483,83 @@ pub(super) async fn login_bing(email: &str, password: &str, page: &Page) -> Resu
     }
 
     info!("登录按钮点击成功，准备输入账号密码");
-    let email_input = tokio::time::timeout(
-        Duration::from_secs(10),
-        page.find_xpath(concat!(
+    let email_input = wait_for_xpath(
+        page,
+        concat!(
             "//input[@type='email' or @name='loginfmt']",
             "|//input[@id='usernameEntry']",
-        )),
+        ),
+        Duration::from_secs(10),
     )
     .await
-    .map_err(|_| anyhow!("寻找账号输入位置超时"))?
-    .map_err(|e| anyhow::Error::msg(format!("寻找账号输入位置有误：{}", e)))?;
+    .map_err(|e| anyhow!("寻找账号输入位置超时：{e}"))?;
 
     email_input.type_str(email).await?;
 
     info!("账号输入成功，准备点击下一步");
 
-    let next_button = page
-        .find_xpath(concat!(
+    let next_button = wait_for_xpath(
+        page,
+        concat!(
             "//button[@type='submit']",
             "|//button[text()='下一步']",
-        ))
-        .await?;
+        ),
+        Duration::from_secs(10),
+    )
+    .await?;
 
     next_button.click().await?;
 
     let password_input = loop {
-        match tokio::time::timeout(
-            Duration::from_secs(5),
-            page.find_xpath(concat!(
+        match wait_for_xpath(
+            page,
+            concat!(
                 "//input[@type='password' or @name='passwd']",
                 "|//input[@id='passwordInput']",
-            )),
+            ),
+            Duration::from_secs(5),
         )
         .await
         {
-            Ok(Ok(input)) => break input,
-            Ok(Err(_)) | Err(_) => {
-                if let Some(Ok(button)) = tokio::time::timeout(
+            Ok(input) => break input,
+            Err(_) => {
+                if let Ok(button) = wait_for_xpath(
+                    page,
+                    "//*[text()='暂时跳过']",
                     Duration::from_secs(5),
-                    page.find_xpath("//*[text()='暂时跳过']"),
                 )
                 .await
-                .ok()
                 {
                     let _ = button.click().await;
                 }
 
-                if let Some(Ok(button)) = tokio::time::timeout(
-                    Duration::from_secs(5),
-                    page.find_xpath(concat!(
+                if let Ok(button) = wait_for_xpath(
+                    page,
+                    concat!(
                         "//span[@role='button' and (text()='其他登录方法' or text()='Other ways to sign in')]",
                         "|//*[text()='其他登录方法']"
-                    )),
+                    ),
+                    Duration::from_secs(5),
                 )
                 .await
-                .ok()
                 {
                     let _ = button.click().await;
                 }
 
-                let button = tokio::time::timeout(
-                    Duration::from_secs(5),
-                    page.find_xpath(concat!(
+                let button = wait_for_xpath(
+                    page,
+                    concat!(
                         "//*[text()='使用密码']",
                         "|//*[text()='Use your password']",
                         "|//button[contains(text(), '使用密码')]",
                         "|//button[contains(text(), 'Use your password')]",
                         "|//a[contains(text(), '使用密码')]",
                         "|//a[contains(text(), 'Use your password')]",
-                    )),
+                    ),
+                    Duration::from_secs(5),
                 )
                 .await
-                .map_err(|_| anyhow!("等待使用密码按钮超时"))??;
+                .map_err(|e| anyhow!("等待使用密码按钮超时：{e}"))?;
 
                 button.click().await?;
             }
@@ -530,41 +570,46 @@ pub(super) async fn login_bing(email: &str, password: &str, page: &Page) -> Resu
 
     info!("密码输入成功，准备点击登录");
 
-    let sign_in_button = page
-        .find_xpath(concat!(
+    let sign_in_button = wait_for_xpath(
+        page,
+        concat!(
             "//button[@type='submit']",
             "|//button[text()='登录']",
             "|//button[text()='Sign in']",
             "|//button[text()='下一步']",
             "|//button[text()='Next']",
-        ))
-        .await?;
+        ),
+        Duration::from_secs(10),
+    )
+    .await?;
 
     sign_in_button.click().await?;
 
     info!("登录按钮点击成功");
 
-    if let Ok(Ok(_)) = tokio::time::timeout(
+    if wait_for_xpath(
+        page,
+        "//*[contains(text(), '保持登录状态')]|//*[contains(text(), 'Stay signed in')]",
         Duration::from_secs(5),
-        page.find_xpath("//*[contains(text(), '保持登录状态')]|//*[contains(text(), 'Stay signed in')]"),
     )
     .await
+    .is_ok()
     {
-        if let Ok(ok_button) = page
-            .find_xpath(concat!(
-                "//button[text()='是']",
-                "|//button[text()='Yes']",
-            ))
-            .await
+        if let Ok(ok_button) = wait_for_xpath(
+            page,
+            concat!("//button[text()='是']", "|//button[text()='Yes']"),
+            Duration::from_secs(3),
+        )
+        .await
         {
             let _ = ok_button.click().await;
         }
-    } else if let Ok(ok_button) = page
-        .find_xpath(concat!(
-            "//button[text()='是']",
-            "|//button[text()='Yes']",
-        ))
-        .await
+    } else if let Ok(ok_button) = wait_for_xpath(
+        page,
+        concat!("//button[text()='是']", "|//button[text()='Yes']"),
+        Duration::from_secs(3),
+    )
+    .await
     {
         let _ = ok_button.click().await;
     }
@@ -576,11 +621,11 @@ pub(super) async fn login_bing(email: &str, password: &str, page: &Page) -> Resu
 pub(super) async fn check_login_status(page: &Page) -> Result<bool> {
     page.goto(BING_URL).await?;
     page.wait_for_navigation().await?;
-    page.reload().await?;
+    reload_hard(page).await?;
     tokio::time::sleep(Duration::from_secs(2)).await;
 
-    match tokio::time::timeout(Duration::from_secs(25), page.find_element("#id_s")).await {
-        Ok(Ok(ele)) => {
+    match wait_for_element(page, "#id_s", Duration::from_secs(25)).await {
+        Ok(ele) => {
             let status = ele.attribute("aria-hidden").await?;
             match status.as_deref() {
                 Some("true") => Ok(true),
@@ -589,7 +634,7 @@ pub(super) async fn check_login_status(page: &Page) -> Result<bool> {
                 _ => Err(anyhow!("未知状态")),
             }
         }
-        _ => {
+        Err(_) => {
             anyhow::bail!("没有找到登录状态元素")
         }
     }
@@ -597,9 +642,9 @@ pub(super) async fn check_login_status(page: &Page) -> Result<bool> {
 
 async fn click_login_button(page: &Page) -> Result<()> {
     // 新版 Bing 首页可能不显示登录入口，优先在搜索结果页头部寻找
-    let login_button = tokio::time::timeout(
-        Duration::from_secs(10),
-        page.find_xpath(concat!(
+    let login_button = wait_for_xpath(
+        page,
+        concat!(
             "//span[@id='id_s']",
             "|//*[@id='id_a']",
             "|//a[@id='id_l']",
@@ -609,24 +654,24 @@ async fn click_login_button(page: &Page) -> Result<()> {
             "|//button[span[text()='登录'] or span[text()='Sign in'] or span[text()='登入']]",
             "|//button[contains(@aria-label, '登录') or contains(@aria-label, 'Sign in') or contains(@aria-label, '登入')]",
             "|//button[contains(text(), '登录') or contains(text(), 'Sign in') or contains(text(), '登入')]",
-        )),
+        ),
+        Duration::from_secs(10),
     )
     .await;
 
     let login_button = match login_button {
-        Ok(Ok(btn)) => btn,
-        _ => {
+        Ok(btn) => btn,
+        Err(_) => {
             info!("首页未找到登录按钮，尝试从搜索结果页登录");
             page.goto("https://cn.bing.com/search?q=bing").await?;
             page.wait_for_navigation().await?;
-            tokio::time::timeout(
+            wait_for_xpath(
+                page,
+                "//header//a[contains(text(), '登录') or contains(text(), 'Sign in')]",
                 Duration::from_secs(10),
-                page.find_xpath(
-                    "//header//a[contains(text(), '登录') or contains(text(), 'Sign in')]",
-                ),
             )
             .await
-            .map_err(|_| anyhow!("等待登录按钮超时"))??
+            .map_err(|e| anyhow!("等待登录按钮超时：{e}"))?
         }
     };
 
@@ -642,16 +687,20 @@ async fn get_pc_search_process(page: &Page) -> Result<(u32, u32)> {
     let _ = page.wait_for_navigation().await;
     tokio::time::sleep(Duration::from_secs(3)).await;
 
-    // 新版 Rewards 页面直接在卡片里展示进度，例如 "搜索: 0/1"
+    // 新版 Rewards 页面直接在卡片里展示进度，例如中文 "搜索: 0/1" 或英文 "Search: 0/1"。
     let progress: Option<String> = page
         .evaluate(
             r#"(() => {
                 const cards = Array.from(document.querySelectorAll('main *'));
-                const card = cards.find(el => el.textContent.includes('必应搜索连续打卡'));
+                const card = cards.find(el => {
+                    const t = el.textContent;
+                    return t.includes('必应搜索连续打卡') ||
+                           /PC\s*search|Bing\s*search|search\s*streak/i.test(t);
+                });
                 if (!card) return null;
                 let node = card;
-                for (let i = 0; i < 6 && node; i++) {
-                    const m = node.textContent.match(/搜索[:：]\s*(\d+)\s*\/\s*(\d+)/);
+                for (let i = 0; i < 8 && node; i++) {
+                    const m = node.textContent.match(/(?:搜索|Search)[:：]?\s*(\d+)\s*\/\s*(\d+)/i);
                     if (m) return `${m[1]}/${m[2]}`;
                     node = node.parentElement;
                 }
