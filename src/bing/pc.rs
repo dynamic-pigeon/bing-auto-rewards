@@ -1,20 +1,19 @@
 use std::{
-    ffi::OsStr,
     path::{Path, PathBuf},
-    sync::Arc,
-    thread::sleep,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use anyhow::{Result, anyhow};
-use headless_chrome::{Browser, Tab};
+use chromiumoxide::browser::Browser;
+use chromiumoxide::page::Page;
+use futures::StreamExt;
 use rand::seq::IndexedRandom;
 use tracing::{debug, info, warn};
 
 use crate::{
     bing::{
         BING_URL, BingBot, GAP_NUM, GAP_RANGE, REWARDS_URL, REWARDS_URL_DS, SLEEP_RANGE, close_tab,
-        default_options_builder, get_one_tab, retry::Retryable, shot_when_failed,
+        default_browser_config, get_one_page, shot_when_failed,
     },
     random::ExpectedNTrigger,
 };
@@ -23,14 +22,14 @@ static PC_USER_AGENT: &str = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36
 const MAX_PC_SEARCH_TIMES: usize = 20;
 
 impl BingBot {
-    pub(crate) fn new_pc_browser(
+    pub(crate) async fn new_pc_browser(
         &mut self,
         store_local: bool,
         account: &str,
         browser_path: &Option<String>,
         proxy: &Option<String>,
     ) -> Result<()> {
-        self.close_browser();
+        self.close_browser().await;
 
         let (temp_dir, user_dir) = if store_local {
             (None, Some(prepare_local_user_data_dir(account)?))
@@ -41,64 +40,55 @@ impl BingBot {
             (Some(dir), Some(path))
         };
 
-        let options = build_pc_options(browser_path, proxy, user_dir)?;
-        let browser = Browser::new(options)?;
+        let config = build_pc_config(browser_path, proxy, user_dir)?;
+
+        let (browser, mut handler) = Browser::launch(config)
+            .await
+            .map_err(|e| anyhow!("启动浏览器失败：{}", e))?;
+
+        let handler_task = tokio::spawn(async move {
+            while let Some(h) = handler.next().await {
+                if h.is_err() {
+                    break;
+                }
+            }
+        });
+
+        let page = get_one_page(&browser).await?;
 
         self.browser = Some(browser);
+        self.page = Some(page);
         self.temp_dir = temp_dir;
         self.store_local = store_local;
         self.account = account.to_string();
         self.browser_path = browser_path.clone();
         self.proxy = proxy.clone();
+        self.handler_task = Some(handler_task);
         Ok(())
     }
 
-    pub(crate) fn restart_pc_browser(&mut self) -> Result<()> {
-        self.close_browser();
-
-        let (temp_dir, user_dir) = if self.store_local {
-            (None, Some(prepare_local_user_data_dir(&self.account)?))
-        } else {
-            let dir = match self.temp_dir.take() {
-                Some(dir) => dir,
-                None => {
-                    std::fs::create_dir_all("./tmp")?;
-                    tempfile::TempDir::new_in("./tmp")?
-                }
-            };
-            let path = dir.path().to_path_buf();
-            (Some(dir), Some(path))
-        };
-
-        let options = build_pc_options(&self.browser_path, &self.proxy, user_dir)?;
-        let browser = Browser::new(options)?;
-
-        self.browser = Some(browser);
-        self.temp_dir = temp_dir;
-        debug!("浏览器重启完成");
-        Ok(())
-    }
-
-    fn close_browser(&mut self) {
-        self.browser.take();
+    pub(crate) async fn restart_pc_browser(&mut self) -> Result<()> {
+        let store_local = self.store_local;
+        let account = self.account.clone();
+        let browser_path = self.browser_path.clone();
+        let proxy = self.proxy.clone();
+        self.close_browser().await;
+        self.new_pc_browser(store_local, &account, &browser_path, &proxy)
+            .await
     }
 }
 
-fn build_pc_options<'a>(
-    browser_path: &'a Option<String>,
-    proxy: &'a Option<String>,
+fn build_pc_config(
+    browser_path: &Option<String>,
+    proxy: &Option<String>,
     user_dir: Option<PathBuf>,
-) -> Result<headless_chrome::LaunchOptions<'a>> {
-    default_options_builder(vec![OsStr::new(const_format::formatcp!(
-        "--user-agent='{}'",
-        PC_USER_AGENT
-    ))])
-    .path(browser_path.as_deref().map(PathBuf::from))
-    .user_data_dir(user_dir)
-    .window_size(Some((1920, 1080)))
-    .proxy_server(proxy.as_deref())
-    .build()
-    .map_err(|e| anyhow!("构建浏览器启动选项失败：{}", e))
+) -> Result<chromiumoxide::browser::BrowserConfig> {
+    default_browser_config(
+        vec![format!("--user-agent='{}'", PC_USER_AGENT)],
+        browser_path,
+        user_dir,
+        proxy,
+    )
 }
 
 fn prepare_local_user_data_dir(account: &str) -> Result<PathBuf> {
@@ -121,58 +111,78 @@ fn mark_user_data_last_used(user_data_dir: &Path) -> Result<()> {
 /// 为什么是 &mut BingBot 而不是 &BingBot
 ///
 /// 其实是借用了 rust 单一所有权的特性，保证同一时间只有一个可变引用在使用 browser
-pub(crate) fn process_account(
+pub(crate) async fn process_account(
     email: &str,
     password: &str,
     browser_bot: &mut BingBot,
 ) -> Result<()> {
     info!("开始登录Bing账号: {}", email);
-    let browser = browser_bot.get_browser()?;
-    let mut tab = get_one_tab(browser)?;
-    tab.set_default_timeout(Duration::from_secs(25));
-    (|| {
-        if !check_login_status(&tab)? {
-            login_bing(email, password, &tab)?;
-            sleep(Duration::from_secs(5));
-            if !check_login_status(&tab)? {
-                return Err(anyhow!("登录后检查状态仍然未登录"));
+    let page = browser_bot.get_page()?;
+    let mut login_last_err: Option<anyhow::Error> = None;
+    for i in 0..3 {
+        match async {
+            if !check_login_status(page).await? {
+                login_bing(email, password, page).await?;
+                tokio::time::sleep(Duration::from_secs(5)).await;
+                if !check_login_status(page).await? {
+                    return Err(anyhow!("登录后检查状态仍然未登录"));
+                }
+            } else {
+                info!("账号 {} 已登录，无需重复登录", email);
             }
-        } else {
-            info!("账号 {} 已登录，无需重复登录", email);
+            Ok(())
         }
+        .await
+        {
+            Ok(()) => {
+                login_last_err = None;
+                break;
+            }
+            Err(e) => {
+                debug!("账号 {} 第 {} 次登录失败: {}", email, i + 1, e);
+                login_last_err = Some(e);
+                tokio::time::sleep(Duration::from_secs(2)).await;
+            }
+        }
+    }
+    if let Some(e) = login_last_err {
+        let page = browser_bot.get_page().expect("页面已丢失");
+        shot_when_failed(page, "login", email).await;
+        return Err(anyhow!("登录失败: {}", e));
+    }
 
-        Ok(())
-    })
-    .retry(3)
-    .inspect_err(|_| {
-        shot_when_failed(&tab, "login", email);
-    })?;
-
-    sleep(Duration::from_secs(5));
+    tokio::time::sleep(Duration::from_secs(5)).await;
 
     info!("开始尝试点击卡片");
-    let _ = click_rewards(browser, &tab).inspect_err(|_| {
-        shot_when_failed(&tab, "click_rewards", email);
-    });
+    let browser = browser_bot.get_browser()?;
+    let page = browser_bot.get_page()?;
+    if let Err(e) = click_rewards(browser, page).await {
+        warn!("点击奖励卡片失败: {}", e);
+        let page = browser_bot.get_page().expect("页面已丢失");
+        shot_when_failed(page, "click_rewards", email).await;
+    }
 
-    sleep(Duration::from_secs(5));
+    tokio::time::sleep(Duration::from_secs(5)).await;
 
     info!("开始进行搜索任务");
-    search(browser_bot, email, &mut tab).inspect_err(|_| {
-        shot_when_failed(&tab, "search", email);
-    })?;
+    if let Err(e) = search(browser_bot, email).await {
+        let page = browser_bot.get_page().expect("页面已丢失");
+        shot_when_failed(page, "search", email).await;
+        return Err(anyhow!("搜索任务失败: {}", e));
+    }
 
     info!("{} 账号处理完成", email);
     Ok(())
 }
 
-fn search(browser_bot: &mut BingBot, email: &str, tab: &mut Arc<Tab>) -> Result<()> {
+async fn search(browser_bot: &mut BingBot, email: &str) -> Result<()> {
     let search_words = crate::hot_searches::get_hot_words(MAX_PC_SEARCH_TIMES);
 
     let mut trigger = ExpectedNTrigger::new(GAP_NUM);
     for (i, word) in search_words.into_iter().enumerate() {
+        let page = browser_bot.get_page()?;
         let sleep_time = if trigger.next() {
-            match get_pc_search_process(tab) {
+            match get_pc_search_process(page).await {
                 Ok((cur_points, max_points)) => {
                     info!(
                         "账号 {email} 当前搜索积分: {cur_points}，今日最大搜索积分: {max_points}"
@@ -183,7 +193,7 @@ fn search(browser_bot: &mut BingBot, email: &str, tab: &mut Arc<Tab>) -> Result<
                     }
                 }
                 Err(e) => {
-                    shot_when_failed(tab, "rewards_get_failed", email);
+                    shot_when_failed(page, "rewards_get_failed", email).await;
                     warn!("获取账号 {email} 积分详情失败: {e}");
                 }
             }
@@ -201,257 +211,356 @@ fn search(browser_bot: &mut BingBot, email: &str, tab: &mut Arc<Tab>) -> Result<
         );
         const MAX_SLEEP_TIME: u64 = 30;
         if sleep_time < MAX_SLEEP_TIME {
-            sleep(Duration::from_secs(sleep_time));
+            tokio::time::sleep(Duration::from_secs(sleep_time)).await;
         } else {
             let mut slept = 0;
             while slept < sleep_time {
                 let sleep_chunk = std::cmp::min(MAX_SLEEP_TIME, sleep_time - slept);
-                sleep(Duration::from_secs(sleep_chunk));
+                tokio::time::sleep(Duration::from_secs(sleep_chunk)).await;
                 // 空转防止 timeout
-                let _ = tab.reload(false, None);
+                let _ = page.reload().await;
                 slept += sleep_chunk;
             }
         }
 
-        (|| {
-            perform_search_and_click(browser_bot.get_browser()?, tab, &word).inspect_err(|_| {
-                let _ = (|| -> Result<()> {
-                    browser_bot.restart_pc_browser()?;
-                    let new_tab = get_one_tab(browser_bot.get_browser()?)?;
-                    *tab = new_tab;
-                    Ok(())
-                })();
-            })?;
-            info!("第 {} 次搜索完成", i + 1);
-            Ok(())
-        })
-        .retry(3)?;
+        let mut search_last_err: Option<anyhow::Error> = None;
+        for _j in 0..3 {
+            let page = browser_bot.get_page()?;
+            let browser = browser_bot.get_browser()?;
+            match perform_search_and_click(browser, page, &word).await {
+                Ok(()) => {
+                    search_last_err = None;
+                    break;
+                }
+                Err(e) => {
+                    warn!("搜索点击失败，尝试重启浏览器: {}", e);
+                    search_last_err = Some(e);
+                    browser_bot.restart_pc_browser().await?;
+                    tokio::time::sleep(Duration::from_secs(2)).await;
+                }
+            }
+        }
+        if let Some(e) = search_last_err {
+            return Err(e);
+        }
+        info!("第 {} 次搜索完成", i + 1);
     }
 
     Ok(())
 }
 
-fn perform_search_and_click(browser: &mut Browser, tab: &Tab, word: &str) -> Result<()> {
-    let before_tabs = browser.get_tabs().lock().unwrap().clone();
+async fn perform_search_and_click(browser: &Browser, page: &Page, word: &str) -> Result<()> {
+    let before_pages = browser.pages().await?;
 
     let search_url = reqwest::Url::parse_with_params(
         "https://cn.bing.com/search",
         [("q", word), ("PC", "U316"), ("FORM", "CHROMN")],
     )?;
-    tab.navigate_to(search_url.as_str())?;
+    page.goto(search_url.as_str()).await?;
+    page.wait_for_navigation().await?;
 
-    sleep(Duration::from_secs(rand::random_range(1..4)));
+    tokio::time::sleep(Duration::from_secs(rand::random_range(1..4))).await;
 
-    let search_res = tab.wait_for_element("#b_results")?;
+    let search_res = tokio::time::timeout(Duration::from_secs(25), page.find_element("#b_results"))
+        .await
+        .map_err(|_| anyhow!("等待搜索结果超时"))??;
 
-    search_res
-        .wait_for_element("li.b_algo")
-        .map_err(|e| anyhow!(format!("没有找到搜索结果：{e}")))?;
+    tokio::time::timeout(
+        Duration::from_secs(25),
+        search_res.find_element("li.b_algo"),
+    )
+    .await
+    .map_err(|_| anyhow!("查找搜索结果超时"))?
+    .map_err(|e| anyhow!(format!("没有找到搜索结果：{e}")))?;
 
-    let all_res = search_res.find_elements("li.b_algo")?;
+    let all_res = page.find_elements("li.b_algo").await?;
 
     let ele = all_res
         .choose(&mut rand::rng())
         .ok_or(anyhow!("没有找到搜索结果"))?;
 
     ele.click()
+        .await
         .map_err(|e| anyhow!(format!("点击搜索结果失败：{e}")))?;
 
-    sleep(Duration::from_secs(rand::random_range(5..10)));
+    tokio::time::sleep(Duration::from_secs(rand::random_range(5..10))).await;
 
-    close_tab(before_tabs, browser)?;
+    close_tab(before_pages, browser).await?;
 
     Ok(())
 }
 
-fn click_rewards(browser: &mut Browser, tab: &Tab) -> Result<()> {
-    (|| click_daily_set(browser, tab))
-        .retry(3)
-        .inspect_err(|e| {
-            warn!("点击奖励卡片失败: {e}");
-        })?;
-    (|| click_earn(browser, tab)).retry(3).inspect_err(|e| {
+async fn click_rewards(browser: &Browser, page: &Page) -> Result<()> {
+    let mut last_err: Option<anyhow::Error> = None;
+    for i in 0..3 {
+        match click_daily_set(browser, page).await {
+            Ok(()) => {
+                last_err = None;
+                break;
+            }
+            Err(e) => {
+                debug!("点击每日任务卡片第 {} 次失败: {}", i + 1, e);
+                last_err = Some(e);
+                tokio::time::sleep(Duration::from_secs(2)).await;
+            }
+        }
+    }
+    if let Some(e) = last_err {
+        warn!("点击每日任务卡片失败: {e}");
+        return Err(e);
+    }
+
+    let mut last_err: Option<anyhow::Error> = None;
+    for i in 0..3 {
+        match click_earn(browser, page).await {
+            Ok(()) => {
+                last_err = None;
+                break;
+            }
+            Err(e) => {
+                debug!("点击奖励卡片第 {} 次失败: {}", i + 1, e);
+                last_err = Some(e);
+                tokio::time::sleep(Duration::from_secs(2)).await;
+            }
+        }
+    }
+    if let Some(e) = last_err {
         warn!("点击奖励卡片失败: {e}");
-    })?;
+        return Err(e);
+    }
 
     info!("卡片点击完成");
     Ok(())
 }
 
-fn click_earn(browser: &mut Browser, tab: &Tab) -> Result<()> {
-    tab.navigate_to(REWARDS_URL)?;
-    tab.wait_until_navigated()?;
+async fn click_earn(browser: &Browser, page: &Page) -> Result<()> {
+    page.goto(REWARDS_URL).await?;
+    page.wait_for_navigation().await?;
 
-    let ele = tab.wait_for_element("#moreactivities > div > div:nth-of-type(2)")?;
-    let ele = ele.wait_for_elements("a")?;
+    let ele = tokio::time::timeout(
+        Duration::from_secs(25),
+        page.find_element("#moreactivities > div > div:nth-of-type(2)"),
+    )
+    .await
+    .map_err(|_| anyhow!("等待奖励卡片超时"))??;
+    let ele = ele.find_elements("a").await?;
     info!("找到 {} 个奖励卡片，准备点击", ele.len());
 
     for card in ele {
-        let text = card.get_inner_text().unwrap_or_default();
+        let text = card.inner_text().await?.unwrap_or_default();
         if !text.contains("+") {
             continue;
         }
 
-        let before_tabs = browser.get_tabs().lock().unwrap().clone();
-        match card.call_js_fn("function() { this.click(); }", vec![], false) {
-            Ok(_) => info!("通过 JS 点击奖励卡片成功"),
-            Err(e) => warn!("通过 JS 点击奖励卡片失败：{}", e),
+        let before_pages = browser.pages().await?;
+        match card.click().await {
+            Ok(_) => info!("点击奖励卡片成功"),
+            Err(e) => warn!("点击奖励卡片失败：{}", e),
         }
-        sleep(Duration::from_secs(5));
-        let _ = close_tab(before_tabs, browser);
-        sleep(Duration::from_secs(1));
+        tokio::time::sleep(Duration::from_secs(5)).await;
+        let _ = close_tab(before_pages, browser).await;
+        tokio::time::sleep(Duration::from_secs(1)).await;
     }
 
     Ok(())
 }
 
-fn click_daily_set(browser: &mut Browser, tab: &Tab) -> Result<()> {
-    tab.navigate_to(REWARDS_URL_DS)?;
-    tab.wait_until_navigated()?;
-    let ele = tab.wait_for_element("#dailyset > div > div:nth-of-type(2)")?;
-    let ele = ele.wait_for_elements("a")?;
+async fn click_daily_set(browser: &Browser, page: &Page) -> Result<()> {
+    page.goto(REWARDS_URL_DS).await?;
+    page.wait_for_navigation().await?;
+    let ele = tokio::time::timeout(
+        Duration::from_secs(25),
+        page.find_element("#dailyset > div > div:nth-of-type(2)"),
+    )
+    .await
+    .map_err(|_| anyhow!("等待每日任务卡片超时"))??;
+    let ele = ele.find_elements("a").await?;
     info!("找到 {} 个每日任务卡片，准备点击", ele.len());
 
     for card in ele {
-        let before_tabs = browser.get_tabs().lock().unwrap().clone();
-        match card.call_js_fn("function() { this.click(); }", vec![], false) {
-            Ok(_) => info!("通过 JS 点击每日任务卡片成功"),
-            Err(e) => warn!("通过 JS 点击每日任务卡片失败：{}", e),
+        let before_pages = browser.pages().await?;
+        match card.click().await {
+            Ok(_) => info!("点击每日任务卡片成功"),
+            Err(e) => warn!("点击每日任务卡片失败：{}", e),
         }
-        sleep(Duration::from_secs(5));
-        let _ = close_tab(before_tabs, browser);
-        sleep(Duration::from_secs(1));
+        tokio::time::sleep(Duration::from_secs(5)).await;
+        let _ = close_tab(before_pages, browser).await;
+        tokio::time::sleep(Duration::from_secs(1)).await;
     }
 
     Ok(())
 }
 
-pub(super) fn login_bing(email: &str, password: &str, tab: &Tab) -> Result<()> {
-    tab.activate()?;
-    tab.navigate_to(BING_URL)?;
-    tab.wait_until_navigated()?;
-    tab.reload(true, None)?;
-    tab.wait_until_navigated()?;
+pub(super) async fn login_bing(email: &str, password: &str, page: &Page) -> Result<()> {
+    page.activate().await?;
+    page.goto(BING_URL).await?;
+    page.wait_for_navigation().await?;
+    page.reload().await?;
+    page.wait_for_navigation().await?;
 
-    if let Err(e) = (|| {
-        tab.reload(false, None)?;
-        tab.wait_until_navigated()?;
-        sleep(Duration::from_secs(2));
-        click_login_button(tab)
-    })
-    .retry(3)
-    {
-        debug!("当前页面：{}", tab.get_url());
+    let mut click_last_err: Option<anyhow::Error> = None;
+    for i in 0..3 {
+        match async {
+            page.reload().await?;
+            page.wait_for_navigation().await?;
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            click_login_button(page).await
+        }
+        .await
+        {
+            Ok(()) => {
+                click_last_err = None;
+                break;
+            }
+            Err(e) => {
+                debug!("点击登录按钮第 {} 次失败: {}", i + 1, e);
+                click_last_err = Some(e);
+                tokio::time::sleep(Duration::from_secs(2)).await;
+            }
+        }
+    }
+    if let Some(e) = click_last_err {
+        let url = page.url().await?.unwrap_or_default();
+        debug!("当前页面：{}", url);
         warn!("点击登录按钮失败: {}", e);
         return Err(e);
     }
 
     info!("登录按钮点击成功，准备输入账号密码");
-    let email_input = tab
-        .wait_for_xpath_with_custom_timeout(
-            concat!(
-                "//input[@type='email' or @name='loginfmt']",
-                "|//input[@id='usernameEntry']",
-            ),
-            Duration::from_secs(10),
-        )
-        .map_err(|e| anyhow::Error::msg(format!("寻找账号输入位置有误：{}", e)))?;
+    let email_input = tokio::time::timeout(
+        Duration::from_secs(10),
+        page.find_xpath(concat!(
+            "//input[@type='email' or @name='loginfmt']",
+            "|//input[@id='usernameEntry']",
+        )),
+    )
+    .await
+    .map_err(|_| anyhow!("寻找账号输入位置超时"))?
+    .map_err(|e| anyhow::Error::msg(format!("寻找账号输入位置有误：{}", e)))?;
 
-    email_input.type_into(email)?;
+    email_input.type_str(email).await?;
 
     info!("账号输入成功，准备点击下一步");
 
-    let next_button = tab.find_element_by_xpath(concat!(
-        "//button[@type='submit']",
-        "|//button[text()='下一步']",
-    ))?;
+    let next_button = page
+        .find_xpath(concat!(
+            "//button[@type='submit']",
+            "|//button[text()='下一步']",
+        ))
+        .await?;
 
-    next_button.click()?;
+    next_button.click().await?;
 
     let password_input = loop {
-        match tab.wait_for_xpath_with_custom_timeout(
-            concat!(
+        match tokio::time::timeout(
+            Duration::from_secs(5),
+            page.find_xpath(concat!(
                 "//input[@type='password' or @name='passwd']",
                 "|//input[@id='passwordInput']",
-            ),
-            Duration::from_secs(5),
-        ) {
-            Ok(input) => break input,
-            Err(_e) => {
-                let _ = tab
-                    .wait_for_xpath_with_custom_timeout(
-                        "//*[text()='暂时跳过']",
-                        Duration::from_secs(5),
-                    )
-                    .and_then(|button| button.click().map(|_| ()));
+            )),
+        )
+        .await
+        {
+            Ok(Ok(input)) => break input,
+            Ok(Err(_)) | Err(_) => {
+                if let Some(Ok(button)) = tokio::time::timeout(
+                    Duration::from_secs(5),
+                    page.find_xpath("//*[text()='暂时跳过']"),
+                )
+                .await
+                .ok()
+                {
+                    let _ = button.click().await;
+                }
 
-                let _ = tab
-                    .wait_for_xpath_with_custom_timeout(concat!(
+                if let Some(Ok(button)) = tokio::time::timeout(
+                    Duration::from_secs(5),
+                    page.find_xpath(concat!(
                         "//span[@role='button' and (text()='其他登录方法' or text()='Other ways to sign in')]",
                         "|//*[text()='其他登录方法']"
-                    ), Duration::from_secs(5)).and_then(|button| {
-                        button.click().map(|_| ())
-                    });
+                    )),
+                )
+                .await
+                .ok()
+                {
+                    let _ = button.click().await;
+                }
 
-                let button = tab.wait_for_xpath_with_custom_timeout(
-                    concat!(
+                let button = tokio::time::timeout(
+                    Duration::from_secs(5),
+                    page.find_xpath(concat!(
                         "//*[text()='使用密码']",
                         "|//*[text()='Use your password']",
                         "|//button[contains(text(), '使用密码')]",
                         "|//button[contains(text(), 'Use your password')]",
                         "|//a[contains(text(), '使用密码')]",
                         "|//a[contains(text(), 'Use your password')]",
-                    ),
-                    Duration::from_secs(5),
-                )?;
+                    )),
+                )
+                .await
+                .map_err(|_| anyhow!("等待使用密码按钮超时"))??;
 
-                button.click()?;
+                button.click().await?;
             }
         }
     };
 
-    password_input.type_into(password)?;
+    password_input.type_str(password).await?;
 
     info!("密码输入成功，准备点击登录");
 
-    let sign_in_button = tab.find_element_by_xpath(concat!(
-        "//button[@type='submit']",
-        "|//button[text()='登录']",
-        "|//button[text()='Sign in']",
-        "|//button[text()='下一步']",
-        "|//button[text()='Next']",
-    ))?;
+    let sign_in_button = page
+        .find_xpath(concat!(
+            "//button[@type='submit']",
+            "|//button[text()='登录']",
+            "|//button[text()='Sign in']",
+            "|//button[text()='下一步']",
+            "|//button[text()='Next']",
+        ))
+        .await?;
 
-    sign_in_button.click()?;
+    sign_in_button.click().await?;
 
     info!("登录按钮点击成功");
 
-    if let Ok(_) = tab.wait_for_xpath_with_custom_timeout(
-        "//*[contains(text(), '保持登录状态')]|//*[contains(text(), 'Stay signed in')]",
+    if let Ok(Ok(_)) = tokio::time::timeout(
         Duration::from_secs(5),
-    ) && let Ok(ok_button) =
-        tab.find_element_by_xpath(concat!("//button[text()='是']", "|//button[text()='Yes']",))
+        page.find_xpath("//*[contains(text(), '保持登录状态')]|//*[contains(text(), 'Stay signed in')]"),
+    )
+    .await
     {
-        let _ = ok_button.click();
-    } else if let Ok(ok_button) =
-        tab.find_element_by_xpath(concat!("//button[text()='是']", "|//button[text()='Yes']",))
+        if let Ok(ok_button) = page
+            .find_xpath(concat!(
+                "//button[text()='是']",
+                "|//button[text()='Yes']",
+            ))
+            .await
+        {
+            let _ = ok_button.click().await;
+        }
+    } else if let Ok(ok_button) = page
+        .find_xpath(concat!(
+            "//button[text()='是']",
+            "|//button[text()='Yes']",
+        ))
+        .await
     {
-        let _ = ok_button.click();
+        let _ = ok_button.click().await;
     }
 
     info!("登录流程完成");
     Ok(())
 }
 
-pub(super) fn check_login_status(tab: &Tab) -> Result<bool> {
-    tab.navigate_to(BING_URL)?;
-    tab.wait_until_navigated()?;
-    tab.reload(true, None)?;
-    sleep(Duration::from_secs(2));
+pub(super) async fn check_login_status(page: &Page) -> Result<bool> {
+    page.goto(BING_URL).await?;
+    page.wait_for_navigation().await?;
+    page.reload().await?;
+    tokio::time::sleep(Duration::from_secs(2)).await;
 
-    match tab.wait_for_element_with_custom_timeout("#id_s", Duration::from_secs(25)) {
-        Ok(ele) => {
-            let status = ele.get_attribute_value("aria-hidden")?;
+    match tokio::time::timeout(Duration::from_secs(25), page.find_element("#id_s")).await {
+        Ok(Ok(ele)) => {
+            let status = ele.attribute("aria-hidden").await?;
             match status.as_deref() {
                 Some("true") => Ok(true),
                 Some("false") => Ok(false),
@@ -459,14 +568,16 @@ pub(super) fn check_login_status(tab: &Tab) -> Result<bool> {
                 _ => Err(anyhow!("未知状态")),
             }
         }
-        Err(_) => {
-            anyhow::bail!("没有找到登录状态元素");
+        _ => {
+            anyhow::bail!("没有找到登录状态元素")
         }
     }
 }
 
-fn click_login_button(tab: &Tab) -> Result<()> {
-    let login_button =  tab.wait_for_xpath_with_custom_timeout(concat!(
+async fn click_login_button(page: &Page) -> Result<()> {
+    let login_button = tokio::time::timeout(
+        Duration::from_secs(10),
+        page.find_xpath(concat!(
             "//span[@id='id_s']",
             "|//*[@id='id_a']",
             "|//a[@id='id_l']",
@@ -476,25 +587,31 @@ fn click_login_button(tab: &Tab) -> Result<()> {
             "|//button[span[text()='登录'] or span[text()='Sign in'] or span[text()='登入']]",
             "|//button[contains(@aria-label, '登录') or contains(@aria-label, 'Sign in') or contains(@aria-label, '登入')]",
             "|//button[contains(text(), '登录') or contains(text(), 'Sign in') or contains(text(), '登入')]",
-        ), Duration::from_secs(10))?;
+        )),
+    )
+    .await
+    .map_err(|_| anyhow!("等待登录按钮超时"))??;
 
     info!("找到登录按钮，准备点击");
-    sleep(Duration::from_secs(2));
-    login_button.click()?;
-    tab.wait_until_navigated()?;
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    login_button.click().await?;
+    page.wait_for_navigation().await?;
     Ok(())
 }
 
-fn get_pc_search_process(tab: &Tab) -> Result<(u32, u32)> {
-    tab.navigate_to("https://rewards.bing.com/earn")?;
-    let _ = tab.wait_until_navigated();
-    let ele = tab.wait_for_element("#shell > div.grow > div > main > div")?;
-    let button = ele.wait_for_element("button")?;
-    button.click()?;
-    sleep(Duration::from_secs(3));
-    let ele =
-        tab.wait_for_xpath("/html/body/div[3]/div/section/div/div[2]/div/div[1]/div[2]/div[4]")?;
-    let text = ele.get_inner_text()?;
+async fn get_pc_search_process(page: &Page) -> Result<(u32, u32)> {
+    page.goto("https://rewards.bing.com/earn").await?;
+    let _ = page.wait_for_navigation().await;
+    let ele = page
+        .find_element("#shell > div.grow > div > main > div")
+        .await?;
+    let button = ele.find_element("button").await?;
+    button.click().await?;
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    let ele = page
+        .find_xpath("/html/body/div[3]/div/section/div/div[2]/div/div[1]/div[2]/div[4]")
+        .await?;
+    let text = ele.inner_text().await?.unwrap_or_default();
 
     let (cur_points, max_points) = parse_point(&text)?;
     Ok((cur_points, max_points))

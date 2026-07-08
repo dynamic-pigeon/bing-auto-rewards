@@ -3,7 +3,6 @@ use std::{
     path::Path,
     str::FromStr,
     sync::Arc,
-    thread::{Builder, sleep},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
@@ -12,19 +11,17 @@ use chrono::Local;
 use chromiumoxide::browser::{Browser, BrowserConfig};
 use chromiumoxide::page::{Page, ScreenshotParams};
 use chromiumoxide_cdp::cdp::browser_protocol::page::CaptureScreenshotFormat;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::{
     bing::{
         browser_pool::{BingBot, BrowserPool},
-        retry::Retryable,
     },
     hot_searches,
 };
 
 mod browser_pool;
 mod pc;
-mod retry;
 
 #[cfg(feature = "debug")]
 const HEADLESS: bool = false;
@@ -61,20 +58,20 @@ struct Account {
     proxy: Option<String>,
 }
 
-pub(crate) fn process<P: AsRef<Path>>(config_file: P) -> Result<()> {
+pub(crate) async fn process<P: AsRef<Path>>(config_file: P) -> Result<()> {
     let config_file = std::fs::File::open(config_file)?;
 
     let config: Arc<Config> = Arc::new(serde_json::from_reader(config_file)?);
 
     let pool = Arc::new(BrowserPool::new(config.max_threads));
 
-    let run_with_cleanup = |config: Arc<Config>, pool: Arc<BrowserPool>| {
+    let run_with_cleanup = |config: Arc<Config>, pool: Arc<BrowserPool>| async move {
         if let Some(days) = config.user_data_cleanup_days {
             cleanup_stale_user_data(days)
                 .inspect_err(|e| warn!("清理 user-data 失败：{}", e))
                 .ok();
         }
-        process_once(config, pool)
+        process_once(config, pool).await
     };
 
     if let Some(schedule) = config.schedule.as_deref() {
@@ -82,7 +79,7 @@ pub(crate) fn process<P: AsRef<Path>>(config_file: P) -> Result<()> {
             .inspect_err(|e| error!("定时任务格式串解析有误：{}", e))?;
 
         info!("第一次执行无视定时任务");
-        if let Err(e) = run_with_cleanup(Arc::clone(&config), Arc::clone(&pool)) {
+        if let Err(e) = run_with_cleanup(Arc::clone(&config), Arc::clone(&pool)).await {
             error!("定时任务执行失败：{}", e);
         }
 
@@ -95,19 +92,19 @@ pub(crate) fn process<P: AsRef<Path>>(config_file: P) -> Result<()> {
                 time.format("%Y-%m-%d %H:%M:%S"),
                 duration.as_secs()
             );
-            sleep(duration);
-            if let Err(e) = run_with_cleanup(Arc::clone(&config), Arc::clone(&pool)) {
+            tokio::time::sleep(duration).await;
+            if let Err(e) = run_with_cleanup(Arc::clone(&config), Arc::clone(&pool)).await {
                 error!("定时任务执行失败：{}", e);
             }
         }
     } else {
-        run_with_cleanup(config, pool)?;
+        run_with_cleanup(config, pool).await?;
     }
 
     Ok(())
 }
 
-fn process_once(config: Arc<Config>, pool: Arc<BrowserPool>) -> Result<()> {
+async fn process_once(config: Arc<Config>, pool: Arc<BrowserPool>) -> Result<()> {
     // 启动时先获取一次热搜，顺便检测一下网络是否畅通
     hot_searches::fetch_hot_words_blocking().inspect_err(|e| warn!("获取热搜失败: {}", e))?;
 
@@ -116,24 +113,21 @@ fn process_once(config: Arc<Config>, pool: Arc<BrowserPool>) -> Result<()> {
         let account = account.clone();
         let config = Arc::clone(&config);
         let pool = Arc::clone(&pool);
-        let email = account.email.clone();
-        let handle = Builder::new()
-            .name(email.clone())
-            .spawn(move || {
-                process_account(account, config.as_ref(), Arc::clone(&pool));
-            })
-            .map_err(|e| anyhow!("创建账号 {} 的处理线程失败: {}", email, e))?;
+        let handle = tokio::spawn(async move {
+            process_account(account, config.as_ref(), pool).await;
+        });
         handles.push(handle);
     }
 
     let mut errors = 0;
     for handle in handles {
-        if let Err(e) = handle.join() {
+        if let Err(e) = handle.await {
             errors += 1;
-            let err = e
-                .downcast_ref::<String>()
-                .map(String::as_str)
-                .unwrap_or("未知错误");
+            let err = if e.is_panic() {
+                "账号处理任务 panic".to_string()
+            } else {
+                "账号处理任务被取消".to_string()
+            };
             error!("处理账号的线程发生错误：{}", err);
         }
     }
@@ -215,7 +209,7 @@ fn write_last_cleanup_time(root: &Path, now: SystemTime) -> Result<()> {
     Ok(())
 }
 
-fn process_account(
+async fn process_account(
     account: Account,
     &Config {
         store_local,
@@ -224,15 +218,31 @@ fn process_account(
     }: &Config,
     pool: Arc<BrowserPool>,
 ) {
-    let _ = (|| {
-        let mut bot = pool.get_bot();
-        bot.new_pc_browser(store_local, &account.email, browser_path, &account.proxy)?;
-        info!("开始处理 PC 端账号 {}", account.email);
-        pc::process_account(&account.email, &account.password, &mut bot)?;
-        Ok(())
-    })
-    .retry(2)
-    .inspect_err(|e| error!("处理账号 {} 失败: {}", account.email, e));
+    let mut last_err: Option<anyhow::Error> = None;
+    for i in 0..2 {
+        let mut bot = pool.get_bot().await;
+        match async {
+            bot.new_pc_browser(store_local, &account.email, browser_path, &account.proxy)
+                .await?;
+            info!("开始处理 PC 端账号 {}", account.email);
+            pc::process_account(&account.email, &account.password, &mut bot).await?;
+            bot.close_browser().await;
+            Ok(())
+        }
+        .await
+        {
+            Ok(()) => return,
+            Err(e) => {
+                debug!("账号 {} 第 {} 次处理失败: {}", account.email, i + 1, e);
+                last_err = Some(e);
+                bot.close_browser().await;
+                tokio::time::sleep(Duration::from_secs(2)).await;
+            }
+        }
+    }
+    if let Some(e) = last_err {
+        error!("处理账号 {} 失败: {}", account.email, e);
+    }
 }
 
 fn default_browser_config(
@@ -280,23 +290,20 @@ fn default_browser_config(
         .map_err(|e| anyhow!("构建浏览器启动选项失败：{}", e))
 }
 
-fn get_one_page(browser: &Browser, runtime: &tokio::runtime::Runtime) -> Result<Page> {
-    let pages = runtime.block_on(browser.pages())?;
+async fn get_one_page(browser: &Browser) -> Result<Page> {
+    let pages = browser.pages().await?;
     if let Some(page) = pages.into_iter().next() {
         Ok(page)
     } else {
-        runtime
-            .block_on(browser.new_page("about:blank"))
+        browser
+            .new_page("about:blank")
+            .await
             .map_err(|e| anyhow!("创建新页面失败：{}", e))
     }
 }
 
-fn close_tab(
-    before_pages: Vec<Page>,
-    browser: &Browser,
-    runtime: &tokio::runtime::Runtime,
-) -> Result<()> {
-    let after_pages = runtime.block_on(browser.pages())?;
+async fn close_tab(before_pages: Vec<Page>, browser: &Browser) -> Result<()> {
+    let after_pages = browser.pages().await?;
     for page in after_pages {
         let target_id = page.target_id();
         if !before_pages
@@ -304,23 +311,18 @@ fn close_tab(
             .any(|p| p.target_id() == target_id)
         {
             info!("发现新打开的标签页，准备关闭");
-            runtime.block_on(page.close())?;
+            page.close().await?;
             info!("标签页关闭成功");
         }
     }
     Ok(())
 }
 
-fn shot_when_failed(
-    page: &Page,
-    runtime: &tokio::runtime::Runtime,
-    prefix: &str,
-    account: &str,
-) {
+async fn shot_when_failed(page: &Page, prefix: &str, account: &str) {
     let params = ScreenshotParams::builder()
         .format(CaptureScreenshotFormat::Png)
         .build();
-    if let Ok(png) = runtime.block_on(page.screenshot(params)) {
+    if let Ok(png) = page.screenshot(params).await {
         std::fs::create_dir_all("failed").ok();
         let file_name = format!("{prefix}_failure_{account}.png");
         if let Err(e) = std::fs::write(Path::new("failed").join(&file_name), &png) {

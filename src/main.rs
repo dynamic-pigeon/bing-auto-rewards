@@ -7,9 +7,10 @@ mod bing;
 mod hot_searches;
 mod random;
 
-fn main() {
+#[tokio::main]
+async fn main() {
     let _guard = init_tracing();
-    let _ = process("config.json").inspect_err(|e| error!("{}", e));
+    let _ = process("config.json").await.inspect_err(|e| error!("{}", e));
 }
 
 fn init_tracing() -> tracing_appender::non_blocking::WorkerGuard {
