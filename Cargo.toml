@@ -6,7 +6,8 @@ authors = ["dynamic-pigeon <3040313336@qq.com>"]
 license = "MIT"
 
 [dependencies]
-headless_chrome = { version = "1.0" }
+chromiumoxide = "0.9"
+futures = "0.3"
 tempfile = "3.3"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
