@@ -704,6 +704,38 @@ async fn click_login_button(page: &Page) -> Result<()> {
     Ok(())
 }
 
+async fn wait_for_dialog_search_progress(page: &Page, timeout: Duration) -> Result<Option<String>> {
+    let start = std::time::Instant::now();
+    loop {
+        let result: serde_json::Value = page
+            .evaluate(
+                r#"(() => {
+                    const dialog = document.querySelector('dialog[open]') ||
+                                   document.querySelector('[role="dialog"]');
+                    if (!dialog) return { value: null };
+                    const el = Array.from(dialog.querySelectorAll('*'))
+                        .find(e => /必应搜索|Bing search|PC search/i.test(e.textContent));
+                    if (!el) return { value: null };
+                    const text = el.parentElement ? el.parentElement.textContent : el.textContent;
+                    const m = text.match(/(\d+)\s*\/\s*(\d+)/);
+                    return { value: m ? `${m[1]}/${m[2]}` : null };
+                })()"#,
+            )
+            .await?
+            .into_value()?;
+        if let Some(value) = result
+            .get("value")
+            .and_then(|v| v.as_str())
+        {
+            return Ok(Some(value.to_string()));
+        }
+        if start.elapsed() >= timeout {
+            return Ok(None);
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+}
+
 async fn get_pc_search_process(page: &Page) -> Result<(u32, u32)> {
     page.goto("https://rewards.bing.com/earn").await?;
     page.wait_for_navigation().await?;
@@ -723,22 +755,8 @@ async fn get_pc_search_process(page: &Page) -> Result<(u32, u32)> {
     .map_err(|e| anyhow!("等待积分明细按钮超时：{e}"))?;
     detail_button.click().await?;
 
-    let progress: Option<String> = page
-        .evaluate(
-            r#"(() => {
-                const dialog = document.querySelector('dialog[open]') ||
-                               document.querySelector('[role="dialog"]');
-                if (!dialog) return null;
-                const el = Array.from(dialog.querySelectorAll('*'))
-                    .find(e => /必应搜索|Bing search|PC search/i.test(e.textContent));
-                if (!el) return null;
-                const text = el.parentElement ? el.parentElement.textContent : el.textContent;
-                const m = text.match(/(\d+)\s*\/\s*(\d+)/);
-                return m ? `${m[1]}/${m[2]}` : null;
-            })()"#,
-        )
-        .await?
-        .into_value()?;
+    // 积分明细对话框内容是异步加载的，需要轮询等待 "必应搜索" 行出现。
+    let progress = wait_for_dialog_search_progress(page, Duration::from_secs(10)).await?;
 
     // 关闭对话框，避免影响后续操作
     let _ = page
