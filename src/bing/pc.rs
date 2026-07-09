@@ -395,9 +395,11 @@ async fn click_earn(browser: &Browser, page: &Page) -> Result<()> {
     page.goto(REWARDS_URL).await?;
     page.wait_for_navigation().await?;
 
+    // 新版 Earn 页面将奖励卡片直接放在 #moreactivities 下的 grid 中，
+    // 不再使用旧的 #moreactivities > div > div:nth-of-type(2) 嵌套结构。
     let cards = wait_for_elements(
         page,
-        "#moreactivities > div > div:nth-of-type(2) a",
+        "#moreactivities a",
         Duration::from_secs(25),
     )
     .await?;
@@ -426,15 +428,36 @@ async fn click_daily_set(browser: &Browser, page: &Page) -> Result<()> {
     page.goto(REWARDS_URL_DS).await?;
     page.wait_for_navigation().await?;
 
+    // 新版 Dashboard 页面将每日活动卡片直接放在 #dailyset 下的 grid 中，
+    // 不再使用旧的 #dailyset > div > div:nth-of-type(2) 嵌套结构。
+    // 该 grid 默认可能未渲染，需要先展开 "每日活动" 折叠面板。
+    if wait_for_elements(page, "#dailyset a", Duration::from_secs(3)).await.is_err() {
+        if let Ok(toggle) = page.find_element("#dailyset button[aria-expanded]").await {
+            let expanded = toggle
+                .attribute("aria-expanded")
+                .await?
+                .unwrap_or_default();
+            if expanded != "true" {
+                toggle.click().await?;
+                tokio::time::sleep(Duration::from_secs(1)).await;
+            }
+        }
+    }
+
     let cards = wait_for_elements(
         page,
-        "#dailyset > div > div:nth-of-type(2) a",
+        "#dailyset a",
         Duration::from_secs(25),
     )
     .await?;
     info!("找到 {} 个每日任务卡片，准备点击", cards.len());
 
     for card in cards {
+        let text = card.inner_text().await?.unwrap_or_default();
+        if !text.contains("+") {
+            continue;
+        }
+
         let before_pages = browser.pages().await?;
         match card.call_js_fn("function() { this.click(); }", false).await {
             Ok(_) => info!("通过 JS 点击每日任务卡片成功"),
