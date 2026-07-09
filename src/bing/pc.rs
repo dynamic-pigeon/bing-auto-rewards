@@ -431,16 +431,15 @@ async fn click_daily_set(browser: &Browser, page: &Page) -> Result<()> {
     // 新版 Dashboard 页面将每日活动卡片直接放在 #dailyset 下的 grid 中，
     // 不再使用旧的 #dailyset > div > div:nth-of-type(2) 嵌套结构。
     // 该 grid 默认可能未渲染，需要先展开 "每日活动" 折叠面板。
-    if wait_for_elements(page, "#dailyset a", Duration::from_secs(3)).await.is_err() {
-        if let Ok(toggle) = page.find_element("#dailyset button[aria-expanded]").await {
-            let expanded = toggle
-                .attribute("aria-expanded")
-                .await?
-                .unwrap_or_default();
-            if expanded != "true" {
-                toggle.click().await?;
-                tokio::time::sleep(Duration::from_secs(1)).await;
-            }
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    if let Ok(toggle) = page.find_element("#dailyset button[aria-expanded]").await {
+        let expanded = toggle
+            .attribute("aria-expanded")
+            .await?
+            .unwrap_or_default();
+        if expanded != "true" {
+            toggle.click().await?;
+            tokio::time::sleep(Duration::from_secs(2)).await;
         }
     }
 
