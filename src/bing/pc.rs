@@ -684,33 +684,55 @@ async fn click_login_button(page: &Page) -> Result<()> {
 
 async fn get_pc_search_process(page: &Page) -> Result<(u32, u32)> {
     page.goto("https://rewards.bing.com/earn").await?;
-    let _ = page.wait_for_navigation().await;
+    page.wait_for_navigation().await?;
     tokio::time::sleep(Duration::from_secs(3)).await;
 
-    // 新版 Rewards 页面直接在卡片里展示进度，例如中文 "搜索: 0/1" 或英文 "Search: 0/1"。
+    // 点击顶部"积分明细"按钮，弹出真正的积分进度对话框。
+    // 卡片上显示的"搜索: 1/1"只是连续打卡进度，积分明细里的"必应搜索 x/y"才是当日搜索积分。
+    let detail_button = wait_for_xpath(
+        page,
+        concat!(
+            "//button[.//*[contains(text(), '积分明细') or contains(text(), 'Points breakdown')]]",
+            "|//button[contains(., '积分明细') or contains(., 'Points breakdown')]",
+        ),
+        Duration::from_secs(10),
+    )
+    .await
+    .map_err(|e| anyhow!("等待积分明细按钮超时：{e}"))?;
+    detail_button.click().await?;
+
     let progress: Option<String> = page
         .evaluate(
             r#"(() => {
-                const cards = Array.from(document.querySelectorAll('main *'));
-                const card = cards.find(el => {
-                    const t = el.textContent;
-                    return t.includes('必应搜索连续打卡') ||
-                           /PC\s*search|Bing\s*search|search\s*streak/i.test(t);
-                });
-                if (!card) return null;
-                let node = card;
-                for (let i = 0; i < 8 && node; i++) {
-                    const m = node.textContent.match(/(?:搜索|Search)[:：]?\s*(\d+)\s*\/\s*(\d+)/i);
-                    if (m) return `${m[1]}/${m[2]}`;
-                    node = node.parentElement;
-                }
-                return null;
+                const dialog = document.querySelector('dialog[open]') ||
+                               document.querySelector('[role="dialog"]');
+                if (!dialog) return null;
+                const el = Array.from(dialog.querySelectorAll('*'))
+                    .find(e => /必应搜索|Bing search|PC search/i.test(e.textContent));
+                if (!el) return null;
+                const text = el.parentElement ? el.parentElement.textContent : el.textContent;
+                const m = text.match(/(\d+)\s*\/\s*(\d+)/);
+                return m ? `${m[1]}/${m[2]}` : null;
             })()"#,
         )
         .await?
         .into_value()?;
 
-    let text = progress.ok_or(anyhow!("未找到 PC 搜索进度"))?;
+    // 关闭对话框，避免影响后续操作
+    let _ = page
+        .evaluate(
+            r#"(() => {
+                const dialog = document.querySelector('dialog[open]') ||
+                               document.querySelector('[role="dialog"]');
+                if (!dialog) return;
+                const close = dialog.querySelector('button[aria-label="关闭"], button[aria-label="Close"]') ||
+                              dialog.querySelector('button');
+                if (close) close.click();
+            })()"#,
+        )
+        .await;
+
+    let text = progress.ok_or(anyhow!("未找到 PC 搜索积分进度"))?;
     parse_point(&text)
 }
 
