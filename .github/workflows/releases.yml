@@ -6,133 +6,150 @@ on:
       - "v*.*.*"
 
 permissions:
-  contents: write
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
 
 jobs:
-  build-and-release:
-    name: Build and Release for ${{ matrix.os }}
+  build:
+    name: Build ${{ matrix.name }}
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
     strategy:
+      fail-fast: false
       matrix:
         include:
-          - os: ubuntu-latest
+          - name: Linux x86_64
+            os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
-            binary_name: bing-auto-reward
-            archive_ext: tar.gz
-            archive_name: amd64-linux-bing-auto-reward-${{ github.ref_name }}
-          - os: ubuntu-latest
+            binary: bing-auto-reward
+            asset_suffix: linux-x86_64
+            extension: tar.gz
+          - name: Linux ARM64
+            os: ubuntu-latest
             target: aarch64-unknown-linux-gnu
-            binary_name: bing-auto-reward
-            archive_ext: tar.gz
-            archive_name: aarch64-linux-bing-auto-reward-${{ github.ref_name }}
-          - os: windows-latest
-            target: aarch64-pc-windows-msvc
-            binary_name: bing-auto-reward.exe
-            archive_ext: zip
-            archive_name: aarch64-windows-bing-auto-reward-${{ github.ref_name }}
-          - os: windows-latest
+            binary: bing-auto-reward
+            asset_suffix: linux-aarch64
+            extension: tar.gz
+          - name: Windows x86_64
+            os: windows-latest
             target: x86_64-pc-windows-msvc
-            binary_name: bing-auto-reward.exe
-            archive_ext: zip
-            archive_name: amd64-windows-bing-auto-reward-${{ github.ref_name }}
-          - os: macos-latest
+            binary: bing-auto-reward.exe
+            asset_suffix: windows-x86_64
+            extension: zip
+          - name: Windows ARM64
+            os: windows-latest
+            target: aarch64-pc-windows-msvc
+            binary: bing-auto-reward.exe
+            asset_suffix: windows-aarch64
+            extension: zip
+          - name: macOS ARM64
+            os: macos-latest
             target: aarch64-apple-darwin
-            binary_name: bing-auto-reward
-            archive_ext: tar.gz
-            archive_name: aarch64-macos-bing-auto-reward-${{ github.ref_name }}
+            binary: bing-auto-reward
+            asset_suffix: macos-aarch64
+            extension: tar.gz
 
     steps:
-      - name: Checkout code
+      - name: Checkout source
         uses: actions/checkout@v4
 
-      - name: Set up Rust
-        uses: actions-rs/toolchain@v1
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: stable
-          target: ${{ matrix.target }}
-          override: true
+          targets: ${{ matrix.target }}
 
-      - name: Install Linux aarch64 toolchain
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Install Linux ARM64 linker
         if: matrix.target == 'aarch64-unknown-linux-gnu'
         run: |
           sudo apt-get update
-          sudo apt-get install -y gcc-aarch64-linux-gnu binutils-aarch64-linux-gnu
+          sudo apt-get install --yes gcc-aarch64-linux-gnu binutils-aarch64-linux-gnu
 
-      - name: Set up MSVC for ARM64
+      - name: Configure MSVC for ARM64
         if: matrix.target == 'aarch64-pc-windows-msvc'
         uses: ilammy/msvc-dev-cmd@v1
         with:
           arch: amd64_arm64
 
-      - name: Build binary
-        run: cargo build --release --target ${{ matrix.target }}
+      - name: Build release binary
+        run: cargo build --locked --release --target ${{ matrix.target }}
         env:
-          RUST_BACKTRACE: 1
           CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
           CC_aarch64_unknown_linux_gnu: aarch64-linux-gnu-gcc
 
-      - name: Prepare release assets
+      - name: Package Windows asset
+        if: runner.os == 'Windows'
         shell: pwsh
-        if: matrix.os == 'windows-latest'
         run: |
-          # 确定源文件路径
-          $SOURCE_DIR = "target/${{ matrix.target }}/release"
-          $BINARY_PATH = Join-Path $SOURCE_DIR "${{ matrix.binary_name }}"
+          $packageDir = Join-Path $env:RUNNER_TEMP "release-package"
+          $archive = "bing-auto-reward-${{ github.ref_name }}-${{ matrix.asset_suffix }}.${{ matrix.extension }}"
+          $archivePath = Join-Path $env:GITHUB_WORKSPACE $archive
 
-          # 确定资源文件和目录
-          $RESOURCES = @("config.json", "log4rs.yaml")
+          New-Item -ItemType Directory -Path $packageDir -Force | Out-Null
+          Copy-Item "target/${{ matrix.target }}/release/${{ matrix.binary }}" $packageDir
+          Copy-Item -Path "README.md", "LICENSE" -Destination $packageDir
+          Compress-Archive -Path "$packageDir/*" -DestinationPath $archivePath -Force
 
-          # 创建临时打包目录
-          $PACKAGE_DIR = "release_package"
-          New-Item -ItemType Directory -Path $PACKAGE_DIR | Out-Null
-
-          # 复制二进制文件和资源
-          Copy-Item $BINARY_PATH -Destination $PACKAGE_DIR
-          foreach ($res in $RESOURCES) {
-            if (Test-Path $res) {
-              Copy-Item $res -Destination $PACKAGE_DIR
-            }
-          }
-          # 根据系统类型创建压缩包
-          $ARCHIVE_NAME = "${{ matrix.archive_name }}"
-          Compress-Archive -Path "$PACKAGE_DIR\*" -DestinationPath "${ARCHIVE_NAME}.zip"
-          echo "ASSET_PATH=${ARCHIVE_NAME}.zip" >> $env:GITHUB_ENV
-
-      - name: Prepare release assets
+      - name: Package Unix asset
+        if: runner.os != 'Windows'
         shell: bash
-        if: matrix.os != 'windows-latest'
         run: |
-          # 确定源文件路径
-          SOURCE_DIR="target/${{ matrix.target }}/release"
-          BINARY_PATH="$SOURCE_DIR/${{ matrix.binary_name }}"
+          set -euo pipefail
 
-          # 确定资源文件和目录
-          RESOURCES=("config.json" "log4rs.yaml")
+          package_dir="$RUNNER_TEMP/release-package"
+          archive="bing-auto-reward-${{ github.ref_name }}-${{ matrix.asset_suffix }}.${{ matrix.extension }}"
+          archive_path="$GITHUB_WORKSPACE/$archive"
 
-          # 创建临时打包目录
-          PACKAGE_DIR="release_package"
-          mkdir -p "$PACKAGE_DIR"
+          mkdir -p "$package_dir"
+          cp "target/${{ matrix.target }}/release/${{ matrix.binary }}" "$package_dir/"
+          cp README.md LICENSE "$package_dir/"
+          tar -C "$package_dir" -czf "$archive_path" .
 
-          # 复制二进制文件和资源
-          cp "$BINARY_PATH" "$PACKAGE_DIR/"
-          for res in "${RESOURCES[@]}"; do
-            if [ -f "$res" ]; then
-              cp "$res" "$PACKAGE_DIR/"
-            fi
-          done
+      - name: Upload release asset
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-${{ matrix.target }}
+          path: bing-auto-reward-${{ github.ref_name }}-${{ matrix.asset_suffix }}.${{ matrix.extension }}
+          if-no-files-found: error
+          retention-days: 1
 
-          # 根据系统类型创建压缩包
-          ARCHIVE_NAME="${{ matrix.archive_name }}"
-          if [ "${{ matrix.archive_ext }}" = "zip" ]; then
-            (cd "$PACKAGE_DIR" && zip -r "../${ARCHIVE_NAME}.zip" .)
-            echo "ASSET_PATH=${ARCHIVE_NAME}.zip" >> $GITHUB_ENV
-          else
-            (cd "$PACKAGE_DIR" && tar -czf "../${ARCHIVE_NAME}.tar.gz" .)
-            echo "ASSET_PATH=${ARCHIVE_NAME}.tar.gz" >> $GITHUB_ENV
-          fi
+  release:
+    name: Publish GitHub Release
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
 
-      - name: Release
+    steps:
+      - name: Download release assets
+        uses: actions/download-artifact@v4
+        with:
+          path: release-assets
+          merge-multiple: true
+
+      - name: Generate checksums
+        shell: bash
+        run: |
+          set -euo pipefail
+          pushd release-assets
+          sha256sum * > SHA256SUMS
+          popd
+
+      - name: Publish release
         uses: softprops/action-gh-release@v2
         with:
-          files: ${{ env.ASSET_PATH }}
+          files: release-assets/*
+          fail_on_unmatched_files: true
+          generate_release_notes: true
           token: ${{ secrets.GITHUB_TOKEN }}
