@@ -397,12 +397,7 @@ async fn click_earn(browser: &Browser, page: &Page) -> Result<()> {
 
     // 新版 Earn 页面将奖励卡片直接放在 #moreactivities 下的 grid 中，
     // 不再使用旧的 #moreactivities > div > div:nth-of-type(2) 嵌套结构。
-    let cards = wait_for_elements(
-        page,
-        "#moreactivities a",
-        Duration::from_secs(25),
-    )
-    .await?;
+    let cards = wait_for_elements(page, "#moreactivities a", Duration::from_secs(25)).await?;
     info!("找到 {} 个奖励卡片，准备点击", cards.len());
 
     for card in cards {
@@ -428,29 +423,14 @@ async fn click_daily_set(browser: &Browser, page: &Page) -> Result<()> {
     page.goto(REWARDS_URL_DS).await?;
     page.wait_for_navigation().await?;
 
-    // 新版 Dashboard 页面将每日活动卡片直接放在 #dailyset 下的 grid 中，
-    // 不再使用旧的 #dailyset > div > div:nth-of-type(2) 嵌套结构。
-    // 该 grid 默认可能未渲染，需要先展开 "每日活动" 折叠面板。
     tokio::time::sleep(Duration::from_secs(2)).await;
-    if let Ok(toggle) = page.find_element("#dailyset button[aria-expanded]").await {
-        let expanded = toggle
-            .attribute("aria-expanded")
-            .await?
-            .unwrap_or_default();
-        if expanded != "true" {
-            toggle.click().await?;
-            tokio::time::sleep(Duration::from_secs(2)).await;
-        }
-    }
+    expand_daily_set(page).await?;
 
-    let cards = wait_for_elements(
-        page,
-        "#dailyset a",
-        Duration::from_secs(25),
-    )
-    .await?;
+    let cards =
+        wait_for_elements(page, "#dailyset [role='group'] a", Duration::from_secs(25)).await?;
     info!("找到 {} 个每日任务卡片，准备点击", cards.len());
 
+    let mut clicked = 0;
     for card in cards {
         let text = card.inner_text().await?.unwrap_or_default();
         if !text.contains("+") {
@@ -458,15 +438,55 @@ async fn click_daily_set(browser: &Browser, page: &Page) -> Result<()> {
         }
 
         let before_pages = browser.pages().await?;
-        match card.call_js_fn("function() { this.click(); }", false).await {
-            Ok(_) => info!("通过 JS 点击每日任务卡片成功"),
-            Err(e) => warn!("通过 JS 点击每日任务卡片失败：{}", e),
+        if let Err(e) = card.click().await {
+            warn!("点击每日任务卡片失败，尝试通过 JS 点击：{}", e);
+            card.call_js_fn("function() { this.click(); }", false)
+                .await
+                .map_err(|js_err| anyhow!("点击每日任务卡片失败：{e}；JS 回退失败：{js_err}"))?;
         }
+        clicked += 1;
+        info!("每日任务卡片点击成功：{}", text.replace('\n', " "));
         tokio::time::sleep(Duration::from_secs(5)).await;
-        let _ = close_tab(before_pages, browser).await;
+        close_tab(before_pages, browser).await?;
         tokio::time::sleep(Duration::from_secs(1)).await;
     }
 
+    // 卡片状态不会在当前 DOM 中实时更新，刷新后确认后端已经记账。
+    page.reload().await?;
+    page.wait_for_navigation().await?;
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    expand_daily_set(page).await?;
+    let cards =
+        wait_for_elements(page, "#dailyset [role='group'] a", Duration::from_secs(25)).await?;
+    let mut pending = 0;
+    for card in cards {
+        let text = card.inner_text().await?.unwrap_or_default();
+        if text.contains("+") {
+            pending += 1;
+        }
+    }
+    if pending > 0 {
+        anyhow::bail!("仍有 {pending} 个每日任务卡片未完成");
+    }
+
+    info!("每日任务卡片处理完成，本次点击 {} 个", clicked);
+    Ok(())
+}
+
+async fn expand_daily_set(page: &Page) -> Result<()> {
+    // #dailyset 中还有一个带 aria-expanded 的“关于”按钮；真正的折叠开关
+    // 由 React Aria 标记为 slot=trigger。
+    let toggle = wait_for_element(
+        page,
+        "#dailyset button[slot='trigger'][aria-expanded]",
+        Duration::from_secs(10),
+    )
+    .await?;
+    let expanded = toggle.attribute("aria-expanded").await?.unwrap_or_default();
+    if expanded != "true" {
+        toggle.click().await?;
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
     Ok(())
 }
 
@@ -522,10 +542,7 @@ pub(super) async fn login_bing(email: &str, password: &str, page: &Page) -> Resu
 
     let next_button = wait_for_xpath(
         page,
-        concat!(
-            "//button[@type='submit']",
-            "|//button[text()='下一步']",
-        ),
+        concat!("//button[@type='submit']", "|//button[text()='下一步']",),
         Duration::from_secs(10),
     )
     .await?;
@@ -545,12 +562,8 @@ pub(super) async fn login_bing(email: &str, password: &str, page: &Page) -> Resu
         {
             Ok(input) => break input,
             Err(_) => {
-                if let Ok(button) = wait_for_xpath(
-                    page,
-                    "//*[text()='暂时跳过']",
-                    Duration::from_secs(5),
-                )
-                .await
+                if let Ok(button) =
+                    wait_for_xpath(page, "//*[text()='暂时跳过']", Duration::from_secs(5)).await
                 {
                     let _ = button.click().await;
                 }
@@ -710,23 +723,19 @@ async fn wait_for_dialog_search_progress(page: &Page, timeout: Duration) -> Resu
         let result: serde_json::Value = page
             .evaluate(
                 r#"(() => {
-                    const dialog = document.querySelector('dialog[open]') ||
-                                   document.querySelector('[role="dialog"]');
-                    if (!dialog) return { value: null };
-                    const el = Array.from(dialog.querySelectorAll('*'))
-                        .find(e => /必应搜索|Bing search|PC search/i.test(e.textContent));
-                    if (!el) return { value: null };
-                    const text = el.parentElement ? el.parentElement.textContent : el.textContent;
+                    const labelPattern = /^(必应搜索|Bing search|PC search)$/i;
+                    const label = Array.from(document.querySelectorAll('p, span, div'))
+                        .find(e => e.children.length === 0 &&
+                                   labelPattern.test((e.textContent || '').trim()));
+                    if (!label) return { value: null };
+                    const text = label.parentElement?.nextElementSibling?.textContent || '';
                     const m = text.match(/(\d+)\s*\/\s*(\d+)/);
                     return { value: m ? `${m[1]}/${m[2]}` : null };
                 })()"#,
             )
             .await?
             .into_value()?;
-        if let Some(value) = result
-            .get("value")
-            .and_then(|v| v.as_str())
-        {
+        if let Some(value) = result.get("value").and_then(|v| v.as_str()) {
             return Ok(Some(value.to_string()));
         }
         if start.elapsed() >= timeout {
@@ -740,6 +749,17 @@ async fn get_pc_search_process(page: &Page) -> Result<(u32, u32)> {
     page.goto("https://rewards.bing.com/earn").await?;
     page.wait_for_navigation().await?;
     tokio::time::sleep(Duration::from_secs(3)).await;
+
+    // Cookie 提示会覆盖页面控件；拒绝可选 Cookie 后再打开积分侧栏。
+    if let Ok(button) = page
+        .find_xpath(
+            "//button[normalize-space()='拒绝' or normalize-space()='全部拒绝' or normalize-space()='Reject' or normalize-space()='Reject all']",
+        )
+        .await
+    {
+        let _ = button.click().await;
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
 
     // 点击顶部"积分明细"按钮，弹出真正的积分进度对话框。
     // 卡片上显示的"搜索: 1/1"只是连续打卡进度，积分明细里的"必应搜索 x/y"才是当日搜索积分。
@@ -755,18 +775,19 @@ async fn get_pc_search_process(page: &Page) -> Result<(u32, u32)> {
     .map_err(|e| anyhow!("等待积分明细按钮超时：{e}"))?;
     detail_button.click().await?;
 
-    // 积分明细对话框内容是异步加载的，需要轮询等待 "必应搜索" 行出现。
+    // 新版积分明细是无 dialog role 的侧栏，内容仍然异步加载。
     let progress = wait_for_dialog_search_progress(page, Duration::from_secs(10)).await?;
 
     // 关闭对话框，避免影响后续操作
     let _ = page
         .evaluate(
             r#"(() => {
-                const dialog = document.querySelector('dialog[open]') ||
-                               document.querySelector('[role="dialog"]');
-                if (!dialog) return;
-                const close = dialog.querySelector('button[aria-label="关闭"], button[aria-label="Close"]') ||
-                              dialog.querySelector('button');
+                const heading = Array.from(document.querySelectorAll('h1, h2, h3, [role="heading"]'))
+                    .find(e => /^(积分明细|Points breakdown)$/i.test((e.textContent || '').trim()));
+                if (!heading) return;
+                const close = heading.parentElement?.querySelector(
+                    'button[aria-label="关闭"], button[aria-label="Close"]'
+                );
                 if (close) close.click();
             })()"#,
         )

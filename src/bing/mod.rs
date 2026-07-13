@@ -7,16 +7,14 @@ use std::{
 };
 
 use anyhow::{Result, anyhow};
-use chrono::Local;
 use chromiumoxide::browser::{Browser, BrowserConfig};
 use chromiumoxide::page::{Page, ScreenshotParams};
 use chromiumoxide_cdp::cdp::browser_protocol::page::CaptureScreenshotFormat;
-use tracing::{debug, error, info, warn};
+use chrono::Local;
+use tracing::{Instrument, debug, error, info, warn};
 
 use crate::{
-    bing::{
-        browser_pool::{BingBot, BrowserPool},
-    },
+    bing::browser_pool::{BingBot, BrowserPool},
     hot_searches,
 };
 
@@ -115,22 +113,32 @@ async fn process_once(config: Arc<Config>, pool: Arc<BrowserPool>) -> Result<()>
         let account = account.clone();
         let config = Arc::clone(&config);
         let pool = Arc::clone(&pool);
-        let handle = tokio::spawn(async move {
-            process_account(account, config.as_ref(), pool).await;
-        });
-        handles.push(handle);
+        let account_email = account.email.clone();
+        let account_span = tracing::info_span!("account", email = %account_email);
+        let handle = tokio::spawn(
+            async move { process_account(account, config.as_ref(), pool).await }
+                .instrument(account_span),
+        );
+        handles.push((account_email, handle));
     }
 
     let mut errors = 0;
-    for handle in handles {
-        if let Err(e) = handle.await {
-            errors += 1;
-            let err = if e.is_panic() {
-                "账号处理任务 panic".to_string()
-            } else {
-                "账号处理任务被取消".to_string()
-            };
-            error!("处理账号的线程发生错误：{}", err);
+    for (account_email, handle) in handles {
+        match handle.await {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => {
+                errors += 1;
+                error!(account = %account_email, "处理账号失败：{:#}", e);
+            }
+            Err(e) => {
+                errors += 1;
+                let err = if e.is_panic() {
+                    "账号处理任务 panic"
+                } else {
+                    "账号处理任务被取消"
+                };
+                error!(account = %account_email, "处理账号的线程发生错误：{}", err);
+            }
         }
     }
 
@@ -219,7 +227,7 @@ async fn process_account(
         ..
     }: &Config,
     pool: Arc<BrowserPool>,
-) {
+) -> Result<()> {
     let mut last_err: Option<anyhow::Error> = None;
     for i in 0..2 {
         let mut bot = pool.get_bot().await;
@@ -233,7 +241,7 @@ async fn process_account(
         }
         .await
         {
-            Ok(()) => return,
+            Ok(()) => return Ok(()),
             Err(e) => {
                 debug!("账号 {} 第 {} 次处理失败: {}", account.email, i + 1, e);
                 last_err = Some(e);
@@ -243,8 +251,9 @@ async fn process_account(
         }
     }
     if let Some(e) = last_err {
-        error!("处理账号 {} 失败: {}", account.email, e);
+        return Err(anyhow!("处理账号 {} 失败: {}", account.email, e));
     }
+    Err(anyhow!("处理账号 {} 失败，未记录具体原因", account.email))
 }
 
 fn default_browser_config(
@@ -267,25 +276,22 @@ fn default_browser_config(
     }
 
     let mut chrome_args = vec![
-        "--disable-dev-shm-usage".to_string(),
-        "--disable-extensions".to_string(),
-        "--disable-blink-features=AutomationControlled".to_string(),
-        "--allow-running-insecure-content".to_string(),
-        "--disable-plugins".to_string(),
-        "--disable-images".to_string(),
-        "--disable-web-security".to_string(),
-        "--mute-audio".to_string(),
-        "--no-first-run".to_string(),
-        "--no-default-browser-check".to_string(),
+        "disable-dev-shm-usage".to_string(),
+        "disable-extensions".to_string(),
+        "disable-blink-features=AutomationControlled".to_string(),
+        "allow-running-insecure-content".to_string(),
+        "disable-plugins".to_string(),
+        "disable-images".to_string(),
+        "disable-web-security".to_string(),
+        "mute-audio".to_string(),
+        "no-first-run".to_string(),
+        "no-default-browser-check".to_string(),
     ];
     chrome_args.extend(args);
-
-    if let Some(proxy) = proxy {
-        chrome_args.push("--proxy-server".to_string());
-        chrome_args.push(proxy.clone());
-    }
-
     config = config.args(chrome_args);
+    if let Some(proxy) = proxy {
+        config = config.arg(("proxy-server", proxy.as_str()));
+    }
 
     config
         .build()
@@ -308,10 +314,7 @@ async fn close_tab(before_pages: Vec<Page>, browser: &Browser) -> Result<()> {
     let after_pages = browser.pages().await?;
     for page in after_pages {
         let target_id = page.target_id();
-        if !before_pages
-            .iter()
-            .any(|p| p.target_id() == target_id)
-        {
+        if !before_pages.iter().any(|p| p.target_id() == target_id) {
             info!("发现新打开的标签页，准备关闭");
             page.close().await?;
             info!("标签页关闭成功");

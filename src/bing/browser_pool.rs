@@ -1,11 +1,32 @@
 use std::{
     ops::{Deref, DerefMut},
+    time::Duration,
 };
 
 use anyhow::anyhow;
 use chromiumoxide::browser::Browser;
 use chromiumoxide::page::Page;
 use tokio::task::JoinHandle;
+use tracing::warn;
+
+async fn shutdown_browser(mut browser: Browser, task: JoinHandle<()>) {
+    let closed = browser.close().await.is_ok();
+    let exited = if closed {
+        matches!(
+            tokio::time::timeout(Duration::from_secs(5), browser.wait()).await,
+            Ok(Ok(_))
+        )
+    } else {
+        false
+    };
+
+    if !exited && let Some(Err(e)) = browser.kill().await {
+        warn!("强制关闭浏览器失败：{}", e);
+    }
+
+    task.abort();
+    let _ = task.await;
+}
 
 /// 需要保证 temp_dir 的生命周期长于 browser
 #[derive(Default)]
@@ -30,11 +51,8 @@ impl BingBot {
     }
 
     pub(crate) async fn close_browser(&mut self) {
-        if let (Some(mut browser), Some(task)) =
-            (self.browser.take(), self.handler_task.take())
-        {
-            let _ = browser.close().await;
-            task.abort();
+        if let (Some(browser), Some(task)) = (self.browser.take(), self.handler_task.take()) {
+            shutdown_browser(browser, task).await;
         }
         self.page.take();
     }
@@ -49,9 +67,8 @@ impl Drop for BingBot {
 
         // 在 Drop 中无法 await，尽量异步关闭浏览器并释放资源，避免阻塞 tokio worker。
         let _handle = tokio::spawn(async move {
-            if let (Some(mut browser), Some(task)) = (browser, task) {
-                let _ = browser.close().await;
-                task.abort();
+            if let (Some(browser), Some(task)) = (browser, task) {
+                shutdown_browser(browser, task).await;
             }
             // 浏览器关闭后再释放临时 profile 目录，避免文件仍被占用。
             drop(temp_dir);
