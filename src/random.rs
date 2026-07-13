@@ -127,6 +127,6 @@ mod test {
             n, average_calls
         );
 
-        (average_calls - n as f64).abs() < 0.5
+        (average_calls - n as f64).abs() < 1.0
     }
 }

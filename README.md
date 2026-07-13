@@ -85,10 +85,10 @@ cargo build --release
 可通过环境变量 `RUST_LOG` 调整日志级别，例如：
 
 ```bash
-RUST_LOG=info ./bing-auto-reward
+RUST_LOG=debug,chromiumoxide=error ./bing-auto-reward
 ```
 
-默认级别为 `debug`，并对 `html5ever`、`selectors` 等冗余库设置为 `info`。支持的写法详见 [tracing-subscriber EnvFilter](https://docs.rs/tracing-subscriber/latest/tracing_subscriber/filter/struct.EnvFilter.html)。
+默认项目日志级别为 `info`，`chromiumoxide` 为 `error`。设置 `RUST_LOG` 会覆盖默认过滤器；开启项目调试日志时可同时保留 `chromiumoxide=error` 以避免浏览器协议日志刷屏。支持的写法详见 [tracing-subscriber EnvFilter](https://docs.rs/tracing-subscriber/latest/tracing_subscriber/filter/struct.EnvFilter.html)。
 
 ## 注意事项
 

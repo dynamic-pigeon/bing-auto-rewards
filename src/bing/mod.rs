@@ -1,29 +1,25 @@
 use std::{
-    ffi::OsStr,
     fs,
     path::Path,
     str::FromStr,
     sync::Arc,
-    thread::{Builder, sleep},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use anyhow::{Result, anyhow};
+use chromiumoxide::browser::{Browser, BrowserConfig};
+use chromiumoxide::page::{Page, ScreenshotParams};
+use chromiumoxide_cdp::cdp::browser_protocol::page::CaptureScreenshotFormat;
 use chrono::Local;
-use headless_chrome::{Browser, LaunchOptionsBuilder, Tab};
-use tracing::{error, info, warn};
+use tracing::{Instrument, debug, error, info, warn};
 
 use crate::{
-    bing::{
-        browser_pool::{BingBot, BrowserPool},
-        retry::Retryable,
-    },
+    bing::browser_pool::{BingBot, BrowserPool},
     hot_searches,
 };
 
 mod browser_pool;
 mod pc;
-mod retry;
 
 #[cfg(feature = "debug")]
 const HEADLESS: bool = false;
@@ -60,20 +56,20 @@ struct Account {
     proxy: Option<String>,
 }
 
-pub(crate) fn process<P: AsRef<Path>>(config_file: P) -> Result<()> {
+pub(crate) async fn process<P: AsRef<Path>>(config_file: P) -> Result<()> {
     let config_file = std::fs::File::open(config_file)?;
 
     let config: Arc<Config> = Arc::new(serde_json::from_reader(config_file)?);
 
     let pool = Arc::new(BrowserPool::new(config.max_threads));
 
-    let run_with_cleanup = |config: Arc<Config>, pool: Arc<BrowserPool>| {
+    let run_with_cleanup = |config: Arc<Config>, pool: Arc<BrowserPool>| async move {
         if let Some(days) = config.user_data_cleanup_days {
             cleanup_stale_user_data(days)
                 .inspect_err(|e| warn!("清理 user-data 失败：{}", e))
                 .ok();
         }
-        process_once(config, pool)
+        process_once(config, pool).await
     };
 
     if let Some(schedule) = config.schedule.as_deref() {
@@ -81,7 +77,7 @@ pub(crate) fn process<P: AsRef<Path>>(config_file: P) -> Result<()> {
             .inspect_err(|e| error!("定时任务格式串解析有误：{}", e))?;
 
         info!("第一次执行无视定时任务");
-        if let Err(e) = run_with_cleanup(Arc::clone(&config), Arc::clone(&pool)) {
+        if let Err(e) = run_with_cleanup(Arc::clone(&config), Arc::clone(&pool)).await {
             error!("定时任务执行失败：{}", e);
         }
 
@@ -94,46 +90,55 @@ pub(crate) fn process<P: AsRef<Path>>(config_file: P) -> Result<()> {
                 time.format("%Y-%m-%d %H:%M:%S"),
                 duration.as_secs()
             );
-            sleep(duration);
-            if let Err(e) = run_with_cleanup(Arc::clone(&config), Arc::clone(&pool)) {
+            tokio::time::sleep(duration).await;
+            if let Err(e) = run_with_cleanup(Arc::clone(&config), Arc::clone(&pool)).await {
                 error!("定时任务执行失败：{}", e);
             }
         }
     } else {
-        run_with_cleanup(config, pool)?;
+        run_with_cleanup(config, pool).await?;
     }
 
     Ok(())
 }
 
-fn process_once(config: Arc<Config>, pool: Arc<BrowserPool>) -> Result<()> {
+async fn process_once(config: Arc<Config>, pool: Arc<BrowserPool>) -> Result<()> {
     // 启动时先获取一次热搜，顺便检测一下网络是否畅通
-    hot_searches::fetch_hot_words_blocking().inspect_err(|e| warn!("获取热搜失败: {}", e))?;
+    hot_searches::fetch_hot_words()
+        .await
+        .inspect_err(|e| warn!("获取热搜失败: {}", e))?;
 
     let mut handles = vec![];
     for account in &config.accounts {
         let account = account.clone();
         let config = Arc::clone(&config);
         let pool = Arc::clone(&pool);
-        let email = account.email.clone();
-        let handle = Builder::new()
-            .name(email.clone())
-            .spawn(move || {
-                process_account(account, config.as_ref(), Arc::clone(&pool));
-            })
-            .map_err(|e| anyhow!("创建账号 {} 的处理线程失败: {}", email, e))?;
-        handles.push(handle);
+        let account_email = account.email.clone();
+        let account_span = tracing::info_span!("account", email = %account_email);
+        let handle = tokio::spawn(
+            async move { process_account(account, config.as_ref(), pool).await }
+                .instrument(account_span),
+        );
+        handles.push((account_email, handle));
     }
 
     let mut errors = 0;
-    for handle in handles {
-        if let Err(e) = handle.join() {
-            errors += 1;
-            let err = e
-                .downcast_ref::<String>()
-                .map(String::as_str)
-                .unwrap_or("未知错误");
-            error!("处理账号的线程发生错误：{}", err);
+    for (account_email, handle) in handles {
+        match handle.await {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => {
+                errors += 1;
+                error!(account = %account_email, "处理账号失败：{:#}", e);
+            }
+            Err(e) => {
+                errors += 1;
+                let err = if e.is_panic() {
+                    "账号处理任务 panic"
+                } else {
+                    "账号处理任务被取消"
+                };
+                error!(account = %account_email, "处理账号的线程发生错误：{}", err);
+            }
         }
     }
 
@@ -214,7 +219,7 @@ fn write_last_cleanup_time(root: &Path, now: SystemTime) -> Result<()> {
     Ok(())
 }
 
-fn process_account(
+async fn process_account(
     account: Account,
     &Config {
         store_local,
@@ -222,38 +227,107 @@ fn process_account(
         ..
     }: &Config,
     pool: Arc<BrowserPool>,
-) {
-    let _ = (|| {
-        let mut bot = pool.get_bot();
-        bot.new_pc_browser(store_local, &account.email, browser_path, &account.proxy)?;
-        info!("开始处理 PC 端账号 {}", account.email);
-        pc::process_account(&account.email, &account.password, &mut bot)?;
-        Ok(())
-    })
-    .retry(2)
-    .inspect_err(|e| error!("处理账号 {} 失败: {}", account.email, e));
+) -> Result<()> {
+    let mut last_err: Option<anyhow::Error> = None;
+    for i in 0..2 {
+        let mut bot = pool.get_bot().await;
+        match async {
+            bot.new_pc_browser(store_local, &account.email, browser_path, &account.proxy)
+                .await?;
+            info!("开始处理 PC 端账号 {}", account.email);
+            pc::process_account(&account.email, &account.password, &mut bot).await?;
+            bot.close_browser().await;
+            Ok(())
+        }
+        .await
+        {
+            Ok(()) => return Ok(()),
+            Err(e) => {
+                debug!("账号 {} 第 {} 次处理失败: {}", account.email, i + 1, e);
+                last_err = Some(e);
+                bot.close_browser().await;
+                tokio::time::sleep(Duration::from_secs(2)).await;
+            }
+        }
+    }
+    if let Some(e) = last_err {
+        return Err(anyhow!("处理账号 {} 失败: {}", account.email, e));
+    }
+    Err(anyhow!("处理账号 {} 失败，未记录具体原因", account.email))
 }
 
-#[allow(dead_code)]
-fn get_today_rewards(tab: &Tab) -> Result<String> {
-    tab.navigate_to(REWARDS_URL)?;
-    tab.wait_until_navigated()?;
+fn default_browser_config(
+    args: Vec<String>,
+    browser_path: &Option<String>,
+    user_dir: Option<std::path::PathBuf>,
+    proxy: &Option<String>,
+) -> Result<BrowserConfig> {
+    let mut config = BrowserConfig::builder();
+    if !HEADLESS {
+        config = config.with_head();
+    }
+    config = config.no_sandbox();
+    config = config.window_size(1920, 1080);
+    if let Some(path) = browser_path {
+        config = config.chrome_executable(std::path::PathBuf::from(path));
+    }
+    if let Some(dir) = user_dir {
+        config = config.user_data_dir(dir);
+    }
 
-    let ele = tab.wait_for_xpath_with_custom_timeout(
-        "//*[@id='dailypointToolTipDiv']/p/mee-rewards-counter-animation/span",
-        Duration::from_secs(5),
-    )?;
+    let mut chrome_args = vec![
+        "disable-dev-shm-usage".to_string(),
+        "disable-extensions".to_string(),
+        "disable-blink-features=AutomationControlled".to_string(),
+        "allow-running-insecure-content".to_string(),
+        "disable-plugins".to_string(),
+        "disable-images".to_string(),
+        "disable-web-security".to_string(),
+        "mute-audio".to_string(),
+        "no-first-run".to_string(),
+        "no-default-browser-check".to_string(),
+    ];
+    chrome_args.extend(args);
+    config = config.args(chrome_args);
+    if let Some(proxy) = proxy {
+        config = config.arg(("proxy-server", proxy.as_str()));
+    }
 
-    ele.get_inner_text()
+    config
+        .build()
+        .map_err(|e| anyhow!("构建浏览器启动选项失败：{}", e))
 }
 
-fn shot_when_failed(tab: &Tab, prefix: &str, account: &str) {
-    if let Ok(png) = tab.capture_screenshot(
-        headless_chrome::protocol::cdp::Page::CaptureScreenshotFormatOption::Png,
-        None,
-        None,
-        true,
-    ) {
+async fn get_one_page(browser: &Browser) -> Result<Page> {
+    let pages = browser.pages().await?;
+    if let Some(page) = pages.into_iter().next() {
+        Ok(page)
+    } else {
+        browser
+            .new_page("about:blank")
+            .await
+            .map_err(|e| anyhow!("创建新页面失败：{}", e))
+    }
+}
+
+async fn close_tab(before_pages: Vec<Page>, browser: &Browser) -> Result<()> {
+    let after_pages = browser.pages().await?;
+    for page in after_pages {
+        let target_id = page.target_id();
+        if !before_pages.iter().any(|p| p.target_id() == target_id) {
+            info!("发现新打开的标签页，准备关闭");
+            page.close().await?;
+            info!("标签页关闭成功");
+        }
+    }
+    Ok(())
+}
+
+async fn shot_when_failed(page: &Page, prefix: &str, account: &str) {
+    let params = ScreenshotParams::builder()
+        .format(CaptureScreenshotFormat::Png)
+        .build();
+    if let Ok(png) = page.screenshot(params).await {
         std::fs::create_dir_all("failed").ok();
         let file_name = format!("{prefix}_failure_{account}.png");
         if let Err(e) = std::fs::write(Path::new("failed").join(&file_name), &png) {
@@ -262,61 +336,4 @@ fn shot_when_failed(tab: &Tab, prefix: &str, account: &str) {
             info!("失败截图已保存为 {file_name}");
         }
     }
-}
-
-fn close_tab(before_tabs: Vec<Arc<Tab>>, browser: &mut Browser) -> Result<()> {
-    let after_tabs = browser.get_tabs().lock().unwrap().clone();
-    // 就两三个 tab，直接遍历关闭
-    for tab in after_tabs.iter() {
-        if !before_tabs
-            .iter()
-            .any(|t| t.get_target_id() == tab.get_target_id())
-        {
-            info!("发现新打开的标签页，准备关闭");
-            tab.close(false)?;
-            info!("标签页关闭成功");
-        }
-    }
-    Ok(())
-}
-
-fn get_one_tab(browser: &mut Browser) -> Result<Arc<Tab>> {
-    let tabs = browser.get_tabs().lock().unwrap();
-    if !tabs.is_empty() {
-        tabs[0].set_default_timeout(Duration::from_secs(25));
-        Ok(tabs[0].clone())
-    } else {
-        drop(tabs);
-        let tab = browser.new_tab()?;
-        tab.set_default_timeout(Duration::from_secs(25));
-        Ok(tab)
-    }
-}
-
-fn default_options_builder<'a>(args: Vec<&'a OsStr>) -> LaunchOptionsBuilder<'a> {
-    let mut options = LaunchOptionsBuilder::default();
-    options
-        .headless(HEADLESS)
-        .enable_gpu(false)
-        .idle_browser_timeout(Duration::from_mins(30))
-        .sandbox(false)
-        .args(
-            [
-                "--disable-dev-shm-usage",
-                "--disable-extensions",
-                "--disable-blink-features=AutomationControlled",
-                "--allow-running-insecure-content",
-                "--disable-plugins",
-                "--disable-images",
-                "--disable-web-security",
-                "--mute-audio",
-                "--no-first-run",
-                "--no-default-browser-check",
-            ]
-            .into_iter()
-            .map(std::ffi::OsStr::new)
-            .chain(args)
-            .collect(),
-        );
-    options
 }

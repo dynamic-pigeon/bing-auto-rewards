@@ -7,9 +7,12 @@ mod bing;
 mod hot_searches;
 mod random;
 
-fn main() {
+#[tokio::main(worker_threads = 1)]
+async fn main() -> anyhow::Result<()> {
     let _guard = init_tracing();
-    let _ = process("config.json").inspect_err(|e| error!("{}", e));
+    process("config.json")
+        .await
+        .inspect_err(|e| error!("{}", e))
 }
 
 fn init_tracing() -> tracing_appender::non_blocking::WorkerGuard {
@@ -24,17 +27,11 @@ fn init_tracing() -> tracing_appender::non_blocking::WorkerGuard {
     let (non_blocking, guard) = tracing_appender::non_blocking(file_appender);
 
     let env_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| {
-        EnvFilter::new("debug")
-            .add_directive(
-                "html5ever=info"
-                    .parse()
-                    .expect("html5ever 过滤级别解析失败"),
-            )
-            .add_directive(
-                "selectors=info"
-                    .parse()
-                    .expect("selectors 过滤级别解析失败"),
-            )
+        EnvFilter::new("info").add_directive(
+            "chromiumoxide=error"
+                .parse()
+                .expect("chromiumoxide 日志过滤级别解析失败"),
+        )
     });
 
     tracing_subscriber::registry()
@@ -44,8 +41,6 @@ fn init_tracing() -> tracing_appender::non_blocking::WorkerGuard {
                 .with_target(true)
                 .with_level(true)
                 .with_line_number(true)
-                .with_thread_ids(true)
-                .with_thread_names(true)
                 .with_ansi(false)
                 .with_writer(non_blocking),
         )
@@ -53,9 +48,7 @@ fn init_tracing() -> tracing_appender::non_blocking::WorkerGuard {
             fmt::layer()
                 .with_target(true)
                 .with_level(true)
-                .with_line_number(true)
-                .with_thread_ids(true)
-                .with_thread_names(true),
+                .with_line_number(true),
         )
         .init();
 
