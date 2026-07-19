@@ -4,8 +4,7 @@ use linkme::distributed_slice;
 use serde_json::Value;
 
 use super::{HOT_WORDS_PROVIDERS, HotWordsFuture};
-
-static USER_AGENT: &str = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/142.0.0.0 Safari/537.36";
+use crate::user_agent::user_agent;
 
 /// JSON 路径步骤枚举
 #[derive(Debug, Clone)]
@@ -112,7 +111,7 @@ macro_rules! hot_search_api {
 
                 $(
                     if $use_ua {
-                        client_builder = client_builder.user_agent(USER_AGENT);
+                        client_builder = client_builder.user_agent(user_agent());
                     }
                 )?
 

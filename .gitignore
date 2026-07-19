@@ -15,3 +15,5 @@ tmp*
 
 user-data/
 /docs/
+
+.playwright-cli

@@ -18,9 +18,9 @@ use crate::{
         default_browser_config, get_one_page, shot_when_failed,
     },
     random::ExpectedNTrigger,
+    user_agent::user_agent,
 };
 
-static PC_USER_AGENT: &str = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/142.0.0.0 Safari/537.36";
 const MAX_PC_SEARCH_TIMES: usize = 20;
 
 impl BingBot {
@@ -61,7 +61,7 @@ impl BingBot {
         });
 
         let page = get_one_page(&browser).await?;
-        page.enable_stealth_mode_with_agent(PC_USER_AGENT)
+        page.enable_stealth_mode_with_agent(user_agent())
             .await
             .map_err(|e| anyhow!("启用反检测模式失败：{}", e))?;
 

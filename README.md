@@ -54,7 +54,8 @@ cargo build --release
     "store_local": false,
     "browser_path": "google-chrome-stable",
     "schedule": "0 9 * * *",
-    "user_data_cleanup_days": 7
+    "user_data_cleanup_days": 7,
+    "user_agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/142.0.0.0 Safari/537.36"
 }
 ```
 
@@ -79,6 +80,7 @@ cargo build --release
 | `browser_path` | 否 | 浏览器可执行文件路径，不填则尝试自动查找 |
 | `schedule` | 否 | Cron 表达式，用于定时执行，例如 `0 9 * * *` 表示每天 9 点。不填则只执行一次。详情参见 [croner](https://crates.io/crates/croner) |
 | `user_data_cleanup_days` | 否 | 仅在 `store_local=true` 时生效。程序每次执行任务前会清理 `./user-data` 下超过指定天数未使用的账号目录，根据目录中的 `.last_used` 记录判断 |
+| `user_agent` | 否 | 自定义 User-Agent，同时作用于浏览器访问和热搜词接口请求。不填则使用内置默认值 |
 
 ## 日志级别
 
@@ -96,6 +98,7 @@ RUST_LOG=debug,chromiumoxide=error ./bing-auto-reward
 - 使用代理时，请确保代理服务器可正常访问 Bing 和 Microsoft 登录页面。
 - 定时任务模式下，程序会按 Cron 表达式顺序执行；若某次执行耗时较长，后续执行会顺延等待。
 - 若登录或搜索过程中出现异常，程序会自动截图保存到 `failed/` 目录以便排查。
+- 如果登录频繁失败（例如卡在登录页、提示异常或被风控拦截），可以尝试在 `config.json` 中通过 `user_agent` 换成其他 UA（建议使用与本地浏览器版本一致的 Chrome UA），往往能绕过部分检测。
 
 ## 开发
 

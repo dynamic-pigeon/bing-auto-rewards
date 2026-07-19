@@ -43,6 +43,8 @@ struct Config {
     schedule: Option<String>,
     #[serde(default)]
     user_data_cleanup_days: Option<u64>,
+    /// 自定义 User-Agent，留空则使用内置默认值
+    user_agent: Option<String>,
 }
 
 fn default_max_threads() -> usize {
@@ -60,6 +62,10 @@ pub(crate) async fn process<P: AsRef<Path>>(config_file: P) -> Result<()> {
     let config_file = std::fs::File::open(config_file)?;
 
     let config: Arc<Config> = Arc::new(serde_json::from_reader(config_file)?);
+
+    if let Some(user_agent) = config.user_agent.as_deref() {
+        crate::user_agent::set_user_agent(user_agent);
+    }
 
     let pool = Arc::new(BrowserPool::new(config.max_threads));
 
