@@ -166,7 +166,7 @@ pub(crate) async fn process_account(
     info!("开始尝试点击卡片");
     let browser = browser_bot.get_browser()?;
     let page = browser_bot.get_page()?;
-    if let Err(e) = click_rewards(browser, page).await {
+    if let Err(e) = click_rewards(browser, page, email, password).await {
         warn!("点击奖励卡片失败: {}", e);
         let page = browser_bot.get_page().expect("页面已丢失");
         shot_when_failed(page, "click_rewards", email).await;
@@ -292,10 +292,10 @@ async fn perform_search_and_click(browser: &Browser, page: &Page, word: &str) ->
     Ok(())
 }
 
-async fn click_rewards(browser: &Browser, page: &Page) -> Result<()> {
+async fn click_rewards(browser: &Browser, page: &Page, email: &str, password: &str) -> Result<()> {
     let mut last_err: Option<anyhow::Error> = None;
     for i in 0..3 {
-        match click_daily_set(browser, page).await {
+        match click_daily_set(browser, page, email, password).await {
             Ok(()) => {
                 last_err = None;
                 break;
@@ -315,7 +315,7 @@ async fn click_rewards(browser: &Browser, page: &Page) -> Result<()> {
 
     let mut last_err: Option<anyhow::Error> = None;
     for i in 0..3 {
-        match click_earn(browser, page).await {
+        match click_earn(browser, page, email, password).await {
             Ok(()) => {
                 last_err = None;
                 break;
@@ -398,10 +398,8 @@ async fn wait_for_elements(page: &Page, selector: &str, timeout: Duration) -> Re
     }
 }
 
-async fn click_earn(browser: &Browser, page: &Page) -> Result<()> {
-    page.goto(REWARDS_URL).await?;
-    page.wait_for_navigation().await?;
-    tokio::time::sleep(PAGE_SETTLE_DELAY).await;
+async fn click_earn(browser: &Browser, page: &Page, email: &str, password: &str) -> Result<()> {
+    open_rewards_page(page, REWARDS_URL, email, password).await?;
 
     // 新版 Earn 页面将奖励卡片直接放在 #moreactivities 下的 grid 中，
     // 不再使用旧的 #moreactivities > div > div:nth-of-type(2) 嵌套结构。
@@ -427,11 +425,13 @@ async fn click_earn(browser: &Browser, page: &Page) -> Result<()> {
     Ok(())
 }
 
-async fn click_daily_set(browser: &Browser, page: &Page) -> Result<()> {
-    page.goto(REWARDS_URL_DS).await?;
-    page.wait_for_navigation().await?;
-
-    tokio::time::sleep(PAGE_SETTLE_DELAY).await;
+async fn click_daily_set(
+    browser: &Browser,
+    page: &Page,
+    email: &str,
+    password: &str,
+) -> Result<()> {
+    open_rewards_page(page, REWARDS_URL_DS, email, password).await?;
     expand_daily_set(page).await?;
 
     let cards = wait_for_elements(page, "#dailyset [role='group'] a", LONG_ELEMENT_TIMEOUT).await?;
@@ -477,6 +477,98 @@ async fn click_daily_set(browser: &Browser, page: &Page) -> Result<()> {
 
     info!("每日任务卡片处理完成，本次点击 {} 个", clicked);
     Ok(())
+}
+
+async fn open_rewards_page(
+    page: &Page,
+    rewards_url: &str,
+    email: &str,
+    password: &str,
+) -> Result<()> {
+    page.goto(rewards_url).await?;
+    page.wait_for_navigation().await?;
+    tokio::time::sleep(PAGE_SETTLE_DELAY).await;
+
+    if !is_login_page(page).await? {
+        return Ok(());
+    }
+
+    warn!("进入 Rewards 页面时跳转到了登录界面，准备重新登录账号 {email}");
+    login_bing(email, password, page).await?;
+    tokio::time::sleep(PAGE_SETTLE_DELAY).await;
+
+    page.goto(rewards_url).await?;
+    page.wait_for_navigation().await?;
+    tokio::time::sleep(PAGE_SETTLE_DELAY).await;
+
+    if is_login_page(page).await? {
+        anyhow::bail!("账号 {email} 重新登录后仍然进入登录界面");
+    }
+
+    info!("账号 {email} 重新登录成功，继续处理 Rewards 卡片");
+    Ok(())
+}
+
+async fn is_login_page(page: &Page) -> Result<bool> {
+    let current_url = page.url().await?.unwrap_or_default();
+    if is_microsoft_login_url(&current_url) {
+        return Ok(true);
+    }
+
+    Ok(page
+        .find_element(
+            "input[type='email'], input[name='loginfmt'], input#usernameEntry, \
+             input[type='password'], input[name='passwd'], input#passwordInput",
+        )
+        .await
+        .is_ok())
+}
+
+fn is_microsoft_login_url(url: &str) -> bool {
+    let Ok(url) = reqwest::Url::parse(url) else {
+        return false;
+    };
+    let Some(host) = url.host_str() else {
+        return false;
+    };
+
+    host == "login.live.com"
+        || host.ends_with(".login.live.com")
+        || host == "login.microsoft.com"
+        || (host.starts_with("login.")
+            && (host.ends_with(".microsoftonline.com")
+                || host.ends_with(".microsoftonline.cn")
+                || host.ends_with(".microsoftonline.us")
+                || host.ends_with(".windows.net")))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_microsoft_login_url;
+
+    #[test]
+    fn recognizes_microsoft_login_urls() {
+        assert!(is_microsoft_login_url(
+            "https://login.live.com/login.srf?wa=wsignin1.0"
+        ));
+        assert!(is_microsoft_login_url(
+            "https://login.microsoftonline.com/common/oauth2/authorize"
+        ));
+        assert!(is_microsoft_login_url(
+            "https://login.partner.microsoftonline.cn/common/oauth2/authorize"
+        ));
+    }
+
+    #[test]
+    fn rejects_non_login_urls() {
+        assert!(!is_microsoft_login_url(
+            "https://rewards.bing.com/dashboard"
+        ));
+        assert!(!is_microsoft_login_url(
+            "https://login.live.com.evil.example/login"
+        ));
+        assert!(!is_microsoft_login_url("not a url"));
+    }
 }
 
 async fn expand_daily_set(page: &Page) -> Result<()> {

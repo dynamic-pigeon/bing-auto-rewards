@@ -3,7 +3,7 @@ use std::sync::OnceLock;
 use tracing::info;
 
 /// 默认 User-Agent，未在 config.json 中配置 `user_agent` 时使用
-pub(crate) const DEFAULT_USER_AGENT: &str = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/142.0.0.0 Safari/537.36";
+pub(crate) const DEFAULT_USER_AGENT: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/151.0.0.0 Safari/537.36";
 
 static USER_AGENT: OnceLock<String> = OnceLock::new();
 

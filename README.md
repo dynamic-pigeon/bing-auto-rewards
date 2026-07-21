@@ -55,7 +55,7 @@ cargo build --release
     "browser_path": "google-chrome-stable",
     "schedule": "0 9 * * *",
     "user_data_cleanup_days": 7,
-    "user_agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/142.0.0.0 Safari/537.36"
+    "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/151.0.0.0 Safari/537.36"
 }
 ```
 
