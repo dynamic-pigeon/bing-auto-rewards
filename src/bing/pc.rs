@@ -536,6 +536,8 @@ pub(super) async fn login_bing(email: &str, password: &str, page: &Page) -> Resu
     .await
     .map_err(|e| anyhow!("寻找账号输入位置超时：{e}"))?;
 
+    tokio::time::sleep(Duration::from_secs(1)).await;
+
     email_input.type_str(email).await?;
 
     info!("账号输入成功，准备点击下一步");
@@ -600,6 +602,8 @@ pub(super) async fn login_bing(email: &str, password: &str, page: &Page) -> Resu
             }
         }
     };
+
+    tokio::time::sleep(Duration::from_secs(1)).await;
 
     password_input.type_str(password).await?;
 
