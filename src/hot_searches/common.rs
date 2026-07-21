@@ -107,7 +107,7 @@ macro_rules! hot_search_api {
             #[allow(unused_mut)]
             Box::pin(async move {
                 let mut client_builder = reqwest::ClientBuilder::new()
-                    .timeout(Duration::from_secs(5));
+                    .timeout(Duration::from_secs(15));
 
                 $(
                     if $use_ua {

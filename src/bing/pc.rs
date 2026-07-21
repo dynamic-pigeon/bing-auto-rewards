@@ -22,6 +22,12 @@ use crate::{
 };
 
 const MAX_PC_SEARCH_TIMES: usize = 20;
+const LONG_ELEMENT_TIMEOUT: Duration = Duration::from_secs(40);
+const ELEMENT_TIMEOUT: Duration = Duration::from_secs(20);
+const PASSWORD_ELEMENT_TIMEOUT: Duration = Duration::from_secs(15);
+const PAGE_SETTLE_DELAY: Duration = Duration::from_secs(3);
+const ACTION_SETTLE_DELAY: Duration = Duration::from_secs(2);
+const RETRY_DELAY: Duration = Duration::from_secs(5);
 
 impl BingBot {
     pub(crate) async fn new_pc_browser(
@@ -145,7 +151,7 @@ pub(crate) async fn process_account(
             Err(e) => {
                 debug!("账号 {} 第 {} 次登录失败: {}", email, i + 1, e);
                 login_last_err = Some(e);
-                tokio::time::sleep(Duration::from_secs(2)).await;
+                tokio::time::sleep(RETRY_DELAY).await;
             }
         }
     }
@@ -240,7 +246,7 @@ async fn search(browser_bot: &mut BingBot, email: &str) -> Result<()> {
                     warn!("搜索点击失败，尝试重启浏览器: {}", e);
                     search_last_err = Some(e);
                     browser_bot.restart_pc_browser().await?;
-                    tokio::time::sleep(Duration::from_secs(2)).await;
+                    tokio::time::sleep(RETRY_DELAY).await;
                 }
             }
         }
@@ -265,11 +271,11 @@ async fn perform_search_and_click(browser: &Browser, page: &Page, word: &str) ->
 
     tokio::time::sleep(Duration::from_secs(rand::random_range(1..4))).await;
 
-    wait_for_element(page, "#b_results li.b_algo", Duration::from_secs(25))
+    wait_for_element(page, "#b_results li.b_algo", LONG_ELEMENT_TIMEOUT)
         .await
         .map_err(|e| anyhow!("等待搜索结果超时：{e}"))?;
 
-    let all_res = wait_for_elements(page, "#b_results li.b_algo", Duration::from_secs(25)).await?;
+    let all_res = wait_for_elements(page, "#b_results li.b_algo", LONG_ELEMENT_TIMEOUT).await?;
 
     let ele = all_res
         .choose(&mut rand::rng())
@@ -297,7 +303,7 @@ async fn click_rewards(browser: &Browser, page: &Page) -> Result<()> {
             Err(e) => {
                 debug!("点击每日任务卡片第 {} 次失败: {}", i + 1, e);
                 last_err = Some(e);
-                tokio::time::sleep(Duration::from_secs(2)).await;
+                tokio::time::sleep(RETRY_DELAY).await;
             }
         }
     }
@@ -305,6 +311,7 @@ async fn click_rewards(browser: &Browser, page: &Page) -> Result<()> {
         warn!("点击每日任务卡片失败: {e}");
         return Err(e);
     }
+    tokio::time::sleep(PAGE_SETTLE_DELAY).await;
 
     let mut last_err: Option<anyhow::Error> = None;
     for i in 0..3 {
@@ -316,7 +323,7 @@ async fn click_rewards(browser: &Browser, page: &Page) -> Result<()> {
             Err(e) => {
                 debug!("点击奖励卡片第 {} 次失败: {}", i + 1, e);
                 last_err = Some(e);
-                tokio::time::sleep(Duration::from_secs(2)).await;
+                tokio::time::sleep(RETRY_DELAY).await;
             }
         }
     }
@@ -394,10 +401,11 @@ async fn wait_for_elements(page: &Page, selector: &str, timeout: Duration) -> Re
 async fn click_earn(browser: &Browser, page: &Page) -> Result<()> {
     page.goto(REWARDS_URL).await?;
     page.wait_for_navigation().await?;
+    tokio::time::sleep(PAGE_SETTLE_DELAY).await;
 
     // 新版 Earn 页面将奖励卡片直接放在 #moreactivities 下的 grid 中，
     // 不再使用旧的 #moreactivities > div > div:nth-of-type(2) 嵌套结构。
-    let cards = wait_for_elements(page, "#moreactivities a", Duration::from_secs(25)).await?;
+    let cards = wait_for_elements(page, "#moreactivities a", LONG_ELEMENT_TIMEOUT).await?;
     info!("找到 {} 个奖励卡片，准备点击", cards.len());
 
     for card in cards {
@@ -423,11 +431,10 @@ async fn click_daily_set(browser: &Browser, page: &Page) -> Result<()> {
     page.goto(REWARDS_URL_DS).await?;
     page.wait_for_navigation().await?;
 
-    tokio::time::sleep(Duration::from_secs(2)).await;
+    tokio::time::sleep(PAGE_SETTLE_DELAY).await;
     expand_daily_set(page).await?;
 
-    let cards =
-        wait_for_elements(page, "#dailyset [role='group'] a", Duration::from_secs(25)).await?;
+    let cards = wait_for_elements(page, "#dailyset [role='group'] a", LONG_ELEMENT_TIMEOUT).await?;
     info!("找到 {} 个每日任务卡片，准备点击", cards.len());
 
     let mut clicked = 0;
@@ -454,10 +461,9 @@ async fn click_daily_set(browser: &Browser, page: &Page) -> Result<()> {
     // 卡片状态不会在当前 DOM 中实时更新，刷新后确认后端已经记账。
     page.reload().await?;
     page.wait_for_navigation().await?;
-    tokio::time::sleep(Duration::from_secs(2)).await;
+    tokio::time::sleep(PAGE_SETTLE_DELAY).await;
     expand_daily_set(page).await?;
-    let cards =
-        wait_for_elements(page, "#dailyset [role='group'] a", Duration::from_secs(25)).await?;
+    let cards = wait_for_elements(page, "#dailyset [role='group'] a", LONG_ELEMENT_TIMEOUT).await?;
     let mut pending = 0;
     for card in cards {
         let text = card.inner_text().await?.unwrap_or_default();
@@ -479,13 +485,13 @@ async fn expand_daily_set(page: &Page) -> Result<()> {
     let toggle = wait_for_element(
         page,
         "#dailyset button[slot='trigger'][aria-expanded]",
-        Duration::from_secs(10),
+        ELEMENT_TIMEOUT,
     )
     .await?;
     let expanded = toggle.attribute("aria-expanded").await?.unwrap_or_default();
     if expanded != "true" {
         toggle.click().await?;
-        tokio::time::sleep(Duration::from_millis(500)).await;
+        tokio::time::sleep(ACTION_SETTLE_DELAY).await;
     }
     Ok(())
 }
@@ -495,13 +501,14 @@ pub(super) async fn login_bing(email: &str, password: &str, page: &Page) -> Resu
     page.goto(BING_URL).await?;
     page.wait_for_navigation().await?;
     reload_hard(page).await?;
+    tokio::time::sleep(PAGE_SETTLE_DELAY).await;
 
     let mut click_last_err: Option<anyhow::Error> = None;
     for i in 0..3 {
         match async {
             page.reload().await?;
             page.wait_for_navigation().await?;
-            tokio::time::sleep(Duration::from_secs(2)).await;
+            tokio::time::sleep(PAGE_SETTLE_DELAY).await;
             click_login_button(page).await
         }
         .await
@@ -513,7 +520,7 @@ pub(super) async fn login_bing(email: &str, password: &str, page: &Page) -> Resu
             Err(e) => {
                 debug!("点击登录按钮第 {} 次失败: {}", i + 1, e);
                 click_last_err = Some(e);
-                tokio::time::sleep(Duration::from_secs(2)).await;
+                tokio::time::sleep(RETRY_DELAY).await;
             }
         }
     }
@@ -525,31 +532,34 @@ pub(super) async fn login_bing(email: &str, password: &str, page: &Page) -> Resu
     }
 
     info!("登录按钮点击成功，准备输入账号密码");
+    tokio::time::sleep(ACTION_SETTLE_DELAY).await;
     let email_input = wait_for_xpath(
         page,
         concat!(
             "//input[@type='email' or @name='loginfmt']",
             "|//input[@id='usernameEntry']",
         ),
-        Duration::from_secs(10),
+        ELEMENT_TIMEOUT,
     )
     .await
     .map_err(|e| anyhow!("寻找账号输入位置超时：{e}"))?;
 
-    tokio::time::sleep(Duration::from_secs(1)).await;
+    tokio::time::sleep(ACTION_SETTLE_DELAY).await;
 
     email_input.type_str(email).await?;
+    tokio::time::sleep(ACTION_SETTLE_DELAY).await;
 
     info!("账号输入成功，准备点击下一步");
 
     let next_button = wait_for_xpath(
         page,
         concat!("//button[@type='submit']", "|//button[text()='下一步']",),
-        Duration::from_secs(10),
+        ELEMENT_TIMEOUT,
     )
     .await?;
 
     next_button.click().await?;
+    tokio::time::sleep(PAGE_SETTLE_DELAY).await;
 
     let password_input = loop {
         match wait_for_xpath(
@@ -558,7 +568,7 @@ pub(super) async fn login_bing(email: &str, password: &str, page: &Page) -> Resu
                 "//input[@type='password' or @name='passwd']",
                 "|//input[@id='passwordInput']",
             ),
-            Duration::from_secs(5),
+            PASSWORD_ELEMENT_TIMEOUT,
         )
         .await
         {
@@ -568,6 +578,7 @@ pub(super) async fn login_bing(email: &str, password: &str, page: &Page) -> Resu
                     wait_for_xpath(page, "//*[text()='暂时跳过']", Duration::from_secs(5)).await
                 {
                     let _ = button.click().await;
+                    tokio::time::sleep(ACTION_SETTLE_DELAY).await;
                 }
 
                 if let Ok(button) = wait_for_xpath(
@@ -581,6 +592,7 @@ pub(super) async fn login_bing(email: &str, password: &str, page: &Page) -> Resu
                 .await
                 {
                     let _ = button.click().await;
+                    tokio::time::sleep(ACTION_SETTLE_DELAY).await;
                 }
 
                 let button = wait_for_xpath(
@@ -593,19 +605,21 @@ pub(super) async fn login_bing(email: &str, password: &str, page: &Page) -> Resu
                         "|//a[contains(text(), '使用密码')]",
                         "|//a[contains(text(), 'Use your password')]",
                     ),
-                    Duration::from_secs(5),
+                    PASSWORD_ELEMENT_TIMEOUT,
                 )
                 .await
                 .map_err(|e| anyhow!("等待使用密码按钮超时：{e}"))?;
 
                 button.click().await?;
+                tokio::time::sleep(PAGE_SETTLE_DELAY).await;
             }
         }
     };
 
-    tokio::time::sleep(Duration::from_secs(1)).await;
+    tokio::time::sleep(ACTION_SETTLE_DELAY).await;
 
     password_input.type_str(password).await?;
+    tokio::time::sleep(ACTION_SETTLE_DELAY).await;
 
     info!("密码输入成功，准备点击登录");
 
@@ -618,11 +632,12 @@ pub(super) async fn login_bing(email: &str, password: &str, page: &Page) -> Resu
             "|//button[text()='下一步']",
             "|//button[text()='Next']",
         ),
-        Duration::from_secs(10),
+        ELEMENT_TIMEOUT,
     )
     .await?;
 
     sign_in_button.click().await?;
+    tokio::time::sleep(PAGE_SETTLE_DELAY).await;
 
     info!("登录按钮点击成功");
 
@@ -642,6 +657,7 @@ pub(super) async fn login_bing(email: &str, password: &str, page: &Page) -> Resu
         .await
         {
             let _ = ok_button.click().await;
+            tokio::time::sleep(ACTION_SETTLE_DELAY).await;
         }
     } else if let Ok(ok_button) = wait_for_xpath(
         page,
@@ -651,6 +667,7 @@ pub(super) async fn login_bing(email: &str, password: &str, page: &Page) -> Resu
     .await
     {
         let _ = ok_button.click().await;
+        tokio::time::sleep(ACTION_SETTLE_DELAY).await;
     }
 
     info!("登录流程完成");
@@ -663,7 +680,7 @@ pub(super) async fn check_login_status(page: &Page) -> Result<bool> {
     reload_hard(page).await?;
     tokio::time::sleep(Duration::from_secs(2)).await;
 
-    match wait_for_element(page, "#id_s", Duration::from_secs(25)).await {
+    match wait_for_element(page, "#id_s", LONG_ELEMENT_TIMEOUT).await {
         Ok(ele) => {
             let status = ele.attribute("aria-hidden").await?;
             match status.as_deref() {
@@ -694,7 +711,7 @@ async fn click_login_button(page: &Page) -> Result<()> {
             "|//button[contains(@aria-label, '登录') or contains(@aria-label, 'Sign in') or contains(@aria-label, '登入')]",
             "|//button[contains(text(), '登录') or contains(text(), 'Sign in') or contains(text(), '登入')]",
         ),
-        Duration::from_secs(10),
+        ELEMENT_TIMEOUT,
     )
     .await;
 
@@ -704,10 +721,11 @@ async fn click_login_button(page: &Page) -> Result<()> {
             info!("首页未找到登录按钮，尝试从搜索结果页登录");
             page.goto("https://cn.bing.com/search?q=bing").await?;
             page.wait_for_navigation().await?;
+            tokio::time::sleep(PAGE_SETTLE_DELAY).await;
             wait_for_xpath(
                 page,
                 "//header//a[contains(text(), '登录') or contains(text(), 'Sign in')]",
-                Duration::from_secs(10),
+                ELEMENT_TIMEOUT,
             )
             .await
             .map_err(|e| anyhow!("等待登录按钮超时：{e}"))?
@@ -715,7 +733,7 @@ async fn click_login_button(page: &Page) -> Result<()> {
     };
 
     info!("找到登录按钮，准备点击");
-    tokio::time::sleep(Duration::from_secs(2)).await;
+    tokio::time::sleep(ACTION_SETTLE_DELAY).await;
     login_button.click().await?;
     page.wait_for_navigation().await?;
     Ok(())
@@ -773,14 +791,15 @@ async fn get_pc_search_process(page: &Page) -> Result<(u32, u32)> {
             "//button[.//*[contains(text(), '积分明细') or contains(text(), 'Points breakdown')]]",
             "|//button[contains(., '积分明细') or contains(., 'Points breakdown')]",
         ),
-        Duration::from_secs(10),
+        ELEMENT_TIMEOUT,
     )
     .await
     .map_err(|e| anyhow!("等待积分明细按钮超时：{e}"))?;
     detail_button.click().await?;
+    tokio::time::sleep(ACTION_SETTLE_DELAY).await;
 
     // 新版积分明细是无 dialog role 的侧栏，内容仍然异步加载。
-    let progress = wait_for_dialog_search_progress(page, Duration::from_secs(10)).await?;
+    let progress = wait_for_dialog_search_progress(page, ELEMENT_TIMEOUT).await?;
 
     // 关闭对话框，避免影响后续操作
     let _ = page

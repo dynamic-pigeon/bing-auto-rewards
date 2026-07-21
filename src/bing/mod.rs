@@ -272,6 +272,9 @@ fn default_browser_config(
     if !HEADLESS {
         config = config.with_head();
     }
+    config = config
+        .launch_timeout(Duration::from_secs(60))
+        .request_timeout(Duration::from_secs(60));
     config = config.no_sandbox();
     config = config.window_size(1920, 1080);
     if let Some(path) = browser_path {
