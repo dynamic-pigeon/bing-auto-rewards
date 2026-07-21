@@ -493,8 +493,13 @@ async fn open_rewards_page(
         return Ok(());
     }
 
-    warn!("进入 Rewards 页面时跳转到了登录界面，准备重新登录账号 {email}");
-    login_bing(email, password, page).await?;
+    let current_url = page.url().await?.unwrap_or_default();
+    if !is_microsoft_login_url(&current_url) {
+        anyhow::bail!("账号 {email} 进入了不支持自动填写的账户验证页面");
+    }
+
+    warn!("进入 Rewards 页面时跳转到了登录界面，准备在当前页面重新登录账号 {email}");
+    submit_login_form(email, password, page).await?;
     tokio::time::sleep(PAGE_SETTLE_DELAY).await;
 
     page.goto(rewards_url).await?;
@@ -511,7 +516,7 @@ async fn open_rewards_page(
 
 async fn is_login_page(page: &Page) -> Result<bool> {
     let current_url = page.url().await?.unwrap_or_default();
-    if is_microsoft_login_url(&current_url) {
+    if is_microsoft_login_url(&current_url) || is_microsoft_account_verification_url(&current_url) {
         return Ok(true);
     }
 
@@ -542,9 +547,17 @@ fn is_microsoft_login_url(url: &str) -> bool {
                 || host.ends_with(".windows.net")))
 }
 
+fn is_microsoft_account_verification_url(url: &str) -> bool {
+    let Ok(url) = reqwest::Url::parse(url) else {
+        return false;
+    };
+
+    url.host_str() == Some("account.live.com") && url.path().starts_with("/identity/")
+}
+
 #[cfg(test)]
 mod tests {
-    use super::is_microsoft_login_url;
+    use super::{is_microsoft_account_verification_url, is_microsoft_login_url};
 
     #[test]
     fn recognizes_microsoft_login_urls() {
@@ -565,9 +578,22 @@ mod tests {
             "https://rewards.bing.com/dashboard"
         ));
         assert!(!is_microsoft_login_url(
+            "https://account.live.com/identity/confirm"
+        ));
+        assert!(!is_microsoft_login_url(
             "https://login.live.com.evil.example/login"
         ));
         assert!(!is_microsoft_login_url("not a url"));
+    }
+
+    #[test]
+    fn recognizes_account_verification_urls_without_treating_them_as_login_forms() {
+        let url = "https://account.live.com/identity/confirm?mkt=ZH-CN";
+        assert!(is_microsoft_account_verification_url(url));
+        assert!(!is_microsoft_login_url(url));
+        assert!(!is_microsoft_account_verification_url(
+            "https://account.live.com/"
+        ));
     }
 }
 
@@ -624,6 +650,11 @@ pub(super) async fn login_bing(email: &str, password: &str, page: &Page) -> Resu
     }
 
     info!("登录按钮点击成功，准备输入账号密码");
+    submit_login_form(email, password, page).await
+}
+
+async fn submit_login_form(email: &str, password: &str, page: &Page) -> Result<()> {
+    page.activate().await?;
     tokio::time::sleep(ACTION_SETTLE_DELAY).await;
     let email_input = wait_for_xpath(
         page,
