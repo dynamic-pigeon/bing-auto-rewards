@@ -281,7 +281,9 @@ fn default_browser_config(
         config = config.chrome_executable(std::path::PathBuf::from(path));
     }
     if let Some(dir) = user_dir {
-        config = config.user_data_dir(dir);
+        // Relative --user-data-dir is ignored on Windows; Chrome then hits
+        // the desktop profile and exits 21 if that profile is already in use.
+        config = config.user_data_dir(resolve_user_data_dir(dir)?);
     }
 
     let mut chrome_args = vec![
@@ -305,6 +307,37 @@ fn default_browser_config(
     config
         .build()
         .map_err(|e| anyhow!("构建浏览器启动选项失败：{}", e))
+}
+
+fn resolve_user_data_dir(dir: std::path::PathBuf) -> Result<std::path::PathBuf> {
+    std::path::absolute(&dir).map_err(|e| anyhow!("解析浏览器用户目录失败：{}", e))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::resolve_user_data_dir;
+    use std::path::{Path, PathBuf};
+
+    #[test]
+    fn relative_user_data_dir_becomes_absolute() {
+        let resolved = resolve_user_data_dir(PathBuf::from("./user-data/pc_test@example.com"))
+            .expect("absolutize user-data-dir");
+        assert!(resolved.is_absolute());
+        assert!(resolved.ends_with(Path::new("user-data").join("pc_test@example.com")));
+        assert!(!resolved
+            .to_string_lossy()
+            .starts_with(r"\\?\"), "Chrome rejects Windows UNC paths");
+    }
+
+    #[test]
+    fn absolute_user_data_dir_is_preserved() {
+        let abs = std::env::current_dir()
+            .unwrap()
+            .join("user-data")
+            .join("already-abs");
+        let resolved = resolve_user_data_dir(abs.clone()).expect("absolutize user-data-dir");
+        assert_eq!(resolved, abs);
+    }
 }
 
 async fn get_one_page(browser: &Browser) -> Result<Page> {
