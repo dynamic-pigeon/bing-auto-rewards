@@ -52,6 +52,10 @@ impl BingBot {
             (Some(dir), Some(path))
         };
 
+        if let Some(dir) = user_dir.as_ref() {
+            ensure_profile_unlocked(dir).await?;
+        }
+
         let config = build_pc_config(browser_path, proxy, user_dir)?;
 
         let (browser, mut handler) = Browser::launch(config)
@@ -118,6 +122,115 @@ fn mark_user_data_last_used(user_data_dir: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Chrome 用 `hostname-pid` 锁住 user-data-dir。进程异常退出后锁文件会残留，
+/// 再次启动就会报 SingletonLock: File exists。
+async fn ensure_profile_unlocked(user_data_dir: &Path) -> Result<()> {
+    #[cfg(unix)]
+    {
+        unix_ensure_profile_unlocked(user_data_dir).await?;
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = user_data_dir;
+    }
+    Ok(())
+}
+
+fn parse_chrome_singleton_lock(target: &str) -> Option<(String, u32)> {
+    let (host, pid) = target.rsplit_once('-')?;
+    if host.is_empty() {
+        return None;
+    }
+    Some((host.to_string(), pid.parse().ok()?))
+}
+
+#[cfg(unix)]
+const CHROME_SINGLETON_FILES: [&str; 3] = ["SingletonLock", "SingletonCookie", "SingletonSocket"];
+
+#[cfg(unix)]
+async fn unix_ensure_profile_unlocked(user_data_dir: &Path) -> Result<()> {
+    if let Some((host, pid)) = read_chrome_singleton_lock(user_data_dir) {
+        let same_host = current_hostname().is_some_and(|h| h.eq_ignore_ascii_case(&host));
+        if same_host && is_pid_alive(pid) {
+            warn!(
+                "检测到浏览器仍占用 {}（pid={}），准备结束残留进程",
+                user_data_dir.display(),
+                pid
+            );
+            terminate_pid(pid, false);
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(8);
+            while is_pid_alive(pid) && tokio::time::Instant::now() < deadline {
+                tokio::time::sleep(Duration::from_millis(200)).await;
+            }
+            if is_pid_alive(pid) {
+                terminate_pid(pid, true);
+                tokio::time::sleep(Duration::from_millis(400)).await;
+            }
+            if is_pid_alive(pid) {
+                return Err(anyhow!(
+                    "无法释放浏览器目录 {}，进程 {} 仍在运行",
+                    user_data_dir.display(),
+                    pid
+                ));
+            }
+        }
+    }
+    remove_chrome_singleton_files(user_data_dir);
+    Ok(())
+}
+
+#[cfg(unix)]
+fn read_chrome_singleton_lock(user_data_dir: &Path) -> Option<(String, u32)> {
+    let path = user_data_dir.join("SingletonLock");
+    let target = if let Ok(link) = std::fs::read_link(&path) {
+        link.to_string_lossy().into_owned()
+    } else {
+        std::fs::read_to_string(&path).ok()?
+    };
+    parse_chrome_singleton_lock(target.trim())
+}
+
+#[cfg(unix)]
+fn current_hostname() -> Option<String> {
+    let output = std::process::Command::new("hostname").output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let host = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if host.is_empty() { None } else { Some(host) }
+}
+
+#[cfg(unix)]
+fn is_pid_alive(pid: u32) -> bool {
+    std::process::Command::new("ps")
+        .args(["-p", &pid.to_string()])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+#[cfg(unix)]
+fn terminate_pid(pid: u32, force: bool) {
+    let signal = if force { "-KILL" } else { "-TERM" };
+    let _ = std::process::Command::new("kill")
+        .args([signal, &pid.to_string()])
+        .status();
+}
+
+#[cfg(unix)]
+fn remove_chrome_singleton_files(user_data_dir: &Path) {
+    for name in CHROME_SINGLETON_FILES {
+        let path = user_data_dir.join(name);
+        if path.symlink_metadata().is_ok()
+            && let Err(e) = std::fs::remove_file(&path)
+        {
+            warn!("删除 {} 失败: {}", path.display(), e);
+        }
+    }
+}
+
 /// 为什么是 &mut BingBot 而不是 &BingBot
 ///
 /// 其实是借用了 rust 单一所有权的特性，保证同一时间只有一个可变引用在使用 browser
@@ -156,8 +269,9 @@ pub(crate) async fn process_account(
         }
     }
     if let Some(e) = login_last_err {
-        let page = browser_bot.get_page().expect("页面已丢失");
-        shot_when_failed(page, "login", email).await;
+        if let Ok(page) = browser_bot.get_page() {
+            shot_when_failed(page, "login", email).await;
+        }
         return Err(anyhow!("登录失败: {}", e));
     }
 
@@ -168,16 +282,18 @@ pub(crate) async fn process_account(
     let page = browser_bot.get_page()?;
     if let Err(e) = click_rewards(browser, page, email, password).await {
         warn!("点击奖励卡片失败: {}", e);
-        let page = browser_bot.get_page().expect("页面已丢失");
-        shot_when_failed(page, "click_rewards", email).await;
+        if let Ok(page) = browser_bot.get_page() {
+            shot_when_failed(page, "click_rewards", email).await;
+        }
     }
 
     tokio::time::sleep(Duration::from_secs(5)).await;
 
     info!("开始进行搜索任务");
     if let Err(e) = search(browser_bot, email).await {
-        let page = browser_bot.get_page().expect("页面已丢失");
-        shot_when_failed(page, "search", email).await;
+        if let Ok(page) = browser_bot.get_page() {
+            shot_when_failed(page, "search", email).await;
+        }
         return Err(anyhow!("搜索任务失败: {}", e));
     }
 
@@ -970,5 +1086,36 @@ mod test {
         let (cur, max) = parse_point(text).unwrap();
         assert_eq!(cur, 15);
         assert_eq!(max, 60);
+    }
+
+    #[test]
+    fn parse_chrome_singleton_lock_reads_hostname_and_pid() {
+        assert_eq!(
+            parse_chrome_singleton_lock("MTGQ93YQPH-85812"),
+            Some(("MTGQ93YQPH".to_string(), 85812))
+        );
+        assert_eq!(parse_chrome_singleton_lock("no-pid"), None);
+        assert_eq!(parse_chrome_singleton_lock("-123"), None);
+        assert_eq!(parse_chrome_singleton_lock("onlyhost"), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stale_chrome_singleton_files_are_removed() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let lock = dir.path().join("SingletonLock");
+        std::os::unix::fs::symlink("HOST-99999", &lock).unwrap();
+        std::os::unix::fs::symlink("cookie", dir.path().join("SingletonCookie")).unwrap();
+        std::os::unix::fs::symlink("socket", dir.path().join("SingletonSocket")).unwrap();
+
+        assert_eq!(
+            read_chrome_singleton_lock(dir.path()),
+            Some(("HOST".to_string(), 99999))
+        );
+        assert!(!is_pid_alive(99999));
+        remove_chrome_singleton_files(dir.path());
+        assert!(!dir.path().join("SingletonLock").exists());
+        assert!(!dir.path().join("SingletonCookie").exists());
+        assert!(!dir.path().join("SingletonSocket").exists());
     }
 }

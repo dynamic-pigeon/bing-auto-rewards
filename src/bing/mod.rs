@@ -58,7 +58,61 @@ struct Account {
     proxy: Option<String>,
 }
 
+const INSTANCE_LOCK_PATH: &str = "bing-auto-reward.lock";
+
+/// 进程退出后操作系统会自动释放文件锁；锁文件本身故意不删，
+/// 避免 unlink 后另一个进程创建同名新文件、两边各自加锁。
+#[derive(Debug)]
+struct InstanceLock {
+    _file: fs::File,
+}
+
+fn acquire_instance_lock() -> Result<InstanceLock> {
+    acquire_instance_lock_at(Path::new(INSTANCE_LOCK_PATH))
+}
+
+fn acquire_instance_lock_at(path: &Path) -> Result<InstanceLock> {
+    use std::io::{Seek, SeekFrom, Write};
+
+    let mut file = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(path)
+        .map_err(|e| anyhow!("打开实例锁 {} 失败：{}", path.display(), e))?;
+
+    match file.try_lock() {
+        Ok(()) => {
+            file.set_len(0)?;
+            file.seek(SeekFrom::Start(0))?;
+            write!(file, "{}", std::process::id())?;
+            file.flush()?;
+            Ok(InstanceLock { _file: file })
+        }
+        Err(fs::TryLockError::WouldBlock) => Err(already_running_error(path)),
+        Err(fs::TryLockError::Error(e)) => {
+            Err(anyhow!("获取实例锁 {} 失败：{}", path.display(), e))
+        }
+    }
+}
+
+fn already_running_error(path: &Path) -> anyhow::Error {
+    if let Some(pid) = fs::read_to_string(path)
+        .ok()
+        .and_then(|content| content.trim().parse::<u32>().ok())
+    {
+        anyhow!("已有实例在运行（pid={pid}），请先结束该进程后再启动：kill {pid}")
+    } else {
+        anyhow!(
+            "已有实例在运行（锁文件 {} 被占用），请先结束旧进程后再启动",
+            path.display()
+        )
+    }
+}
+
 pub(crate) async fn process<P: AsRef<Path>>(config_file: P) -> Result<()> {
+    let _instance_lock = acquire_instance_lock()?;
     let config_file = std::fs::File::open(config_file)?;
 
     let config: Arc<Config> = Arc::new(serde_json::from_reader(config_file)?);
@@ -87,10 +141,17 @@ pub(crate) async fn process<P: AsRef<Path>>(config_file: P) -> Result<()> {
             error!("定时任务执行失败：{}", e);
         }
 
-        for time in schedule.iter_after(Local::now()) {
+        // 每次跑完再取“现在之后”的下一次，避免任务耗时超过间隔时立刻补跑过期档期。
+        loop {
             let now = Local::now();
-            let duration = time.signed_duration_since(now);
-            let duration = duration.to_std().unwrap_or_else(|_| Duration::from_secs(0));
+            let Some(time) = schedule.iter_after(now).next() else {
+                info!("定时任务没有后续执行时间，退出");
+                break;
+            };
+            let duration = time
+                .signed_duration_since(now)
+                .to_std()
+                .unwrap_or_else(|_| Duration::from_secs(1));
             info!(
                 "下次任务将在 {} 执行，等待 {} 秒",
                 time.format("%Y-%m-%d %H:%M:%S"),
@@ -287,6 +348,9 @@ fn default_browser_config(
     }
 
     let mut chrome_args = vec![
+        // headless 模式下禁用 GPU，避免 macOS 显示器重配置（睡眠/插拔）时
+        // GPU 进程退出导致整个浏览器进程被带走、WebSocket 断连
+        "disable-gpu".to_string(),
         "disable-dev-shm-usage".to_string(),
         "disable-extensions".to_string(),
         "disable-blink-features=AutomationControlled".to_string(),
@@ -315,8 +379,11 @@ fn resolve_user_data_dir(dir: std::path::PathBuf) -> Result<std::path::PathBuf> 
 
 #[cfg(test)]
 mod tests {
-    use super::resolve_user_data_dir;
+    use super::{acquire_instance_lock_at, resolve_user_data_dir};
+    use chrono::Local;
+    use std::fs;
     use std::path::{Path, PathBuf};
+    use std::str::FromStr;
 
     #[test]
     fn relative_user_data_dir_becomes_absolute() {
@@ -324,9 +391,10 @@ mod tests {
             .expect("absolutize user-data-dir");
         assert!(resolved.is_absolute());
         assert!(resolved.ends_with(Path::new("user-data").join("pc_test@example.com")));
-        assert!(!resolved
-            .to_string_lossy()
-            .starts_with(r"\\?\"), "Chrome rejects Windows UNC paths");
+        assert!(
+            !resolved.to_string_lossy().starts_with(r"\\?\"),
+            "Chrome rejects Windows UNC paths"
+        );
     }
 
     #[test]
@@ -337,6 +405,48 @@ mod tests {
             .join("already-abs");
         let resolved = resolve_user_data_dir(abs.clone()).expect("absolutize user-data-dir");
         assert_eq!(resolved, abs);
+    }
+
+    #[test]
+    fn instance_lock_replaces_stale_pid_file() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("bing-auto-reward.lock");
+        fs::write(&path, "99999").unwrap();
+        let lock = acquire_instance_lock_at(&path).expect("stale lock should be replaceable");
+        let written = fs::read_to_string(&path).unwrap();
+        assert_eq!(written, std::process::id().to_string());
+        drop(lock);
+        assert!(
+            path.exists(),
+            "lock file must stay so the next flock is on the same inode"
+        );
+        let _again = acquire_instance_lock_at(&path).expect("released lock can be reacquired");
+    }
+
+    #[test]
+    fn instance_lock_rejects_second_holder() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("bing-auto-reward.lock");
+        let first = acquire_instance_lock_at(&path).expect("first lock");
+        let err = acquire_instance_lock_at(&path).expect_err("second lock should fail");
+        let msg = err.to_string();
+        assert!(
+            msg.contains(&format!("pid={}", std::process::id())) || msg.contains("被占用"),
+            "{msg}"
+        );
+        drop(first);
+        acquire_instance_lock_at(&path).expect("lock available after drop");
+    }
+
+    #[test]
+    fn next_cron_occurrence_is_after_now() {
+        let schedule = croner::Cron::from_str("0 9,16 * * *").unwrap();
+        let now = Local::now();
+        let next = schedule
+            .iter_after(now)
+            .next()
+            .expect("cron has a next time");
+        assert!(next > now);
     }
 }
 

@@ -1,5 +1,7 @@
 
 config.json
+config.json.bak
+bing-auto-reward.lock
 
 /target
 .vscode
