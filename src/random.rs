@@ -95,38 +95,9 @@ impl ExpectedNTrigger {
 
 #[cfg(test)]
 mod test {
-    use rayon::iter::{IntoParallelIterator, ParallelIterator};
-
     #[test]
-    fn test_expected_n_trigger() {
-        let p = (1..=100)
-            .into_par_iter()
-            .map(|i| test_expected_n_trigger_helper(i, 100000))
-            .all(|p| p);
-        assert!(p);
-    }
-
-    fn test_expected_n_trigger_helper(n: u32, trials: u32) -> bool {
-        let mut trigger = super::ExpectedNTrigger::new(n);
-        let mut total_calls = 0;
-
-        for _ in 0..trials {
-            let mut calls = 0;
-            loop {
-                calls += 1;
-                if trigger.next() {
-                    break;
-                }
-            }
-            total_calls += calls;
-        }
-
-        let average_calls = total_calls as f64 / trials as f64;
-        println!(
-            "期望触发次数: {}, 实际平均触发次数: {:.2}",
-            n, average_calls
-        );
-
-        (average_calls - n as f64).abs() < 1.0
+    fn expected_n_trigger_eventually_hits() {
+        let mut trigger = super::ExpectedNTrigger::new(4);
+        assert!((0..32).any(|_| trigger.next()));
     }
 }

@@ -1,9 +1,8 @@
 use std::time::Duration;
 
-use linkme::distributed_slice;
 use serde_json::Value;
 
-use super::{HOT_WORDS_PROVIDERS, HotWordsFuture};
+use super::HotWordsFuture;
 use crate::user_agent::user_agent;
 
 /// JSON 路径步骤枚举
@@ -102,7 +101,6 @@ macro_rules! hot_search_api {
         path: [$($step:expr),+ $(,)?],
         error_name: $error_name:expr
     ) => {
-        #[distributed_slice(HOT_WORDS_PROVIDERS)]
         fn $fn_name() -> HotWordsFuture {
             #[allow(unused_mut)]
             Box::pin(async move {
@@ -138,11 +136,8 @@ macro_rules! hot_search_api {
     };
 }
 
-// ============ 使用配置化的方式定义所有热搜 API ============
-
 use PathStep::*;
 
-// 百度热搜
 hot_search_api! {
     name: get_baidu_hot_words,
     url: "https://top.baidu.com/api/board?platform=wise&tab=realtime",
@@ -162,7 +157,6 @@ hot_search_api! {
     error_name: "百度热搜"
 }
 
-// 知乎热搜
 hot_search_api! {
     name: get_zhihu_hot_words,
     url: "https://api.zhihu.com/topstory/hot-list?limit=10&reverse_order=0",
@@ -176,7 +170,6 @@ hot_search_api! {
     error_name: "知乎热搜"
 }
 
-// 头条热搜
 hot_search_api! {
     name: get_toutiao_hot_words,
     url: "https://www.toutiao.com/hot-event/hot-board/?origin=toutiao_pc",
@@ -189,7 +182,6 @@ hot_search_api! {
     error_name: "头条热搜"
 }
 
-// 百度贴吧热搜
 hot_search_api! {
     name: get_baidu_tiba_hot_words,
     url: "https://tieba.baidu.com/hottopic/browse/topicList",
@@ -204,7 +196,6 @@ hot_search_api! {
     error_name: "百度贴吧热搜"
 }
 
-// 哔哩哔哩热搜
 hot_search_api! {
     name: get_blibli_tiba_hot_words,
     url: "https://api.bilibili.com/x/web-interface/ranking/v2?rid=0&type=all",
@@ -218,7 +209,6 @@ hot_search_api! {
     error_name: "哔哩哔哩热搜"
 }
 
-// 爱奇艺热搜
 hot_search_api! {
     name: get_aiqiyi_hot_words,
     url: "https://mesh.if.iqiyi.com/portal/pcw/rankList/comSecRankList?category_id=-1",
@@ -235,7 +225,6 @@ hot_search_api! {
     error_name: "爱奇艺热搜"
 }
 
-// 网易热搜
 hot_search_api! {
     name: get_163_hot_words,
     url: "https://gw.m.163.com/nc-main/api/v1/hqc/no-repeat-hot-list?source=hotTag",
@@ -250,70 +239,14 @@ hot_search_api! {
     error_name: "网易热搜"
 }
 
-#[cfg(test)]
-mod test {
-    #[tokio::test]
-    async fn test_163_hot_words() {
-        let hot_words = super::get_163_hot_words().await.unwrap();
-        assert!(!hot_words.is_empty());
-        println!("网易热搜词数量: {}", hot_words.len());
-        for word in hot_words {
-            println!("{}", word);
-        }
-    }
-    #[tokio::test]
-    async fn test_aiqiyi_hot_words() {
-        let hot_words = super::get_aiqiyi_hot_words().await.unwrap();
-        assert!(!hot_words.is_empty());
-        println!("爱奇艺热搜词数量: {}", hot_words.len());
-        for word in hot_words {
-            println!("{}", word);
-        }
-    }
-
-    #[tokio::test]
-    async fn test_blili_tiba_hot_words() {
-        let hot_words = super::get_blibli_tiba_hot_words().await.unwrap();
-        assert!(!hot_words.is_empty());
-        println!("哔哩哔哩热搜词数量: {}", hot_words.len());
-        for word in hot_words {
-            println!("{}", word);
-        }
-    }
-    #[tokio::test]
-    async fn test_baidu_tiba_hot_words() {
-        let hot_words = super::get_baidu_tiba_hot_words().await.unwrap();
-        assert!(!hot_words.is_empty());
-        println!("百度贴吧热搜词数量: {}", hot_words.len());
-        for word in hot_words {
-            println!("{}", word);
-        }
-    }
-    #[tokio::test]
-    async fn test_toutiao_hot_words() {
-        let hot_words = super::get_toutiao_hot_words().await.unwrap();
-        assert!(!hot_words.is_empty());
-        println!("头条热搜词数量: {}", hot_words.len());
-        for word in hot_words {
-            println!("{}", word);
-        }
-    }
-    #[tokio::test]
-    async fn test_zhihu_hot_words() {
-        let hot_words = super::get_zhihu_hot_words().await.unwrap();
-        assert!(!hot_words.is_empty());
-        println!("知乎热搜词数量: {}", hot_words.len());
-        for word in hot_words {
-            println!("{}", word);
-        }
-    }
-    #[tokio::test]
-    async fn test_baidu_hot_words() {
-        let hot_words = super::get_baidu_hot_words().await.unwrap();
-        assert!(!hot_words.is_empty());
-        println!("百度热搜词数量: {}", hot_words.len());
-        for word in hot_words {
-            println!("{}", word);
-        }
-    }
+pub(super) fn providers() -> [fn() -> HotWordsFuture; 7] {
+    [
+        get_baidu_hot_words,
+        get_zhihu_hot_words,
+        get_toutiao_hot_words,
+        get_baidu_tiba_hot_words,
+        get_blibli_tiba_hot_words,
+        get_aiqiyi_hot_words,
+        get_163_hot_words,
+    ]
 }

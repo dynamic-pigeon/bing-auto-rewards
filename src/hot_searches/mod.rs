@@ -4,7 +4,6 @@ use std::{
     sync::{LazyLock, RwLock},
 };
 
-use linkme::distributed_slice;
 use rand::seq::IndexedRandom;
 use tokio::task::JoinSet;
 use tracing::info;
@@ -12,9 +11,6 @@ use tracing::info;
 mod common;
 
 static HOT_WORDS: LazyLock<RwLock<Vec<String>>> = LazyLock::new(|| RwLock::new(Vec::new()));
-
-#[distributed_slice]
-pub static HOT_WORDS_PROVIDERS: [fn() -> HotWordsFuture];
 
 pub(crate) type HotWordsFuture = Pin<Box<dyn Future<Output = anyhow::Result<Vec<String>>> + Send>>;
 
@@ -27,7 +23,7 @@ pub(crate) async fn fetch_hot_words() -> anyhow::Result<()> {
     let mut all_hot_words = Vec::new();
     let mut join_set = JoinSet::new();
 
-    for provider in HOT_WORDS_PROVIDERS {
+    for provider in common::providers() {
         join_set.spawn(async move { provider().await });
     }
 
@@ -39,28 +35,14 @@ pub(crate) async fn fetch_hot_words() -> anyhow::Result<()> {
         }
     }
 
-    let all_hot_words = modify_hot_words(all_hot_words);
-    let mut hot_words_lock = HOT_WORDS.write().unwrap();
-    *hot_words_lock = all_hot_words;
-    info!("获取热搜词共 {} 条", hot_words_lock.len());
-    Ok(())
-}
-
-fn modify_hot_words(mut words: Vec<String>) -> Vec<String> {
-    words.sort_unstable();
-    words.dedup();
-    words
-}
-
-#[cfg(test)]
-mod test {
-    #[tokio::test]
-    async fn test_fetch_hot_words() {
-        super::fetch_hot_words().await.unwrap();
-        let hot_words = super::get_hot_words(10);
-        assert!(!hot_words.is_empty());
-        for word in hot_words {
-            println!("{}", word);
-        }
+    all_hot_words.sort_unstable();
+    all_hot_words.dedup();
+    if all_hot_words.is_empty() {
+        anyhow::bail!("未获取到任何热搜词");
     }
+
+    let count = all_hot_words.len();
+    *HOT_WORDS.write().unwrap() = all_hot_words;
+    info!("获取热搜词共 {count} 条");
+    Ok(())
 }

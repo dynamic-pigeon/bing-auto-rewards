@@ -14,14 +14,17 @@ use tracing::{debug, info, warn};
 
 use crate::{
     bing::{
-        BING_URL, BingBot, GAP_NUM, GAP_RANGE, REWARDS_URL, REWARDS_URL_DS, SLEEP_RANGE, close_tab,
-        default_browser_config, get_one_page, shot_when_failed,
+        BING_URL, BingBot, REWARDS_URL, REWARDS_URL_DS, close_tab, default_browser_config,
+        get_one_page, shot_when_failed,
     },
     random::ExpectedNTrigger,
     user_agent::user_agent,
 };
 
 const MAX_PC_SEARCH_TIMES: usize = 20;
+const SLEEP_RANGE: std::ops::Range<u64> = 30..80;
+const GAP_RANGE: std::ops::Range<u64> = 400..1000;
+const GAP_NUM: u32 = 4;
 const LONG_ELEMENT_TIMEOUT: Duration = Duration::from_secs(40);
 const ELEMENT_TIMEOUT: Duration = Duration::from_secs(20);
 const PASSWORD_ELEMENT_TIMEOUT: Duration = Duration::from_secs(15);
@@ -56,7 +59,7 @@ impl BingBot {
             ensure_profile_unlocked(dir).await?;
         }
 
-        let config = build_pc_config(browser_path, proxy, user_dir)?;
+        let config = default_browser_config(browser_path, user_dir, proxy)?;
 
         let (browser, mut handler) = Browser::launch(config)
             .await
@@ -97,14 +100,6 @@ impl BingBot {
     }
 }
 
-fn build_pc_config(
-    browser_path: &Option<String>,
-    proxy: &Option<String>,
-    user_dir: Option<PathBuf>,
-) -> Result<chromiumoxide::browser::BrowserConfig> {
-    default_browser_config(vec![], browser_path, user_dir, proxy)
-}
-
 fn prepare_local_user_data_dir(account: &str) -> Result<PathBuf> {
     std::fs::create_dir_all("./user-data")?;
     let user_data_dir = std::path::PathBuf::from(format!("./user-data/pc_{}", account));
@@ -118,7 +113,7 @@ fn mark_user_data_last_used(user_data_dir: &Path) -> Result<()> {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_else(|_| Duration::from_secs(0))
         .as_secs();
-    std::fs::write(user_data_dir.join(".last_used"), now.to_string())?;
+    std::fs::write(user_data_dir.join(super::LAST_USED_MARKER), now.to_string())?;
     Ok(())
 }
 
@@ -303,6 +298,9 @@ pub(crate) async fn process_account(
 
 async fn search(browser_bot: &mut BingBot, email: &str) -> Result<()> {
     let search_words = crate::hot_searches::get_hot_words(MAX_PC_SEARCH_TIMES);
+    if search_words.is_empty() {
+        return Err(anyhow!("热搜词为空，无法执行搜索任务"));
+    }
 
     let mut trigger = ExpectedNTrigger::new(GAP_NUM);
     for (i, word) in search_words.into_iter().enumerate() {
