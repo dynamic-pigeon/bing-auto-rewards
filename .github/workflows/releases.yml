@@ -43,7 +43,7 @@ jobs:
             asset_suffix: windows-x86_64
             extension: zip
           - name: Windows ARM64
-            os: windows-latest
+            os: windows-11-arm
             target: aarch64-pc-windows-msvc
             binary: bing-auto-reward.exe
             asset_suffix: windows-aarch64
@@ -57,11 +57,12 @@ jobs:
 
     steps:
       - name: Checkout source
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@master
         with:
+          toolchain: stable
           targets: ${{ matrix.target }}
 
       - name: Cache Rust build
@@ -74,12 +75,6 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install --yes gcc-aarch64-linux-gnu binutils-aarch64-linux-gnu
-
-      - name: Configure MSVC for ARM64
-        if: matrix.target == 'aarch64-pc-windows-msvc'
-        uses: ilammy/msvc-dev-cmd@v1
-        with:
-          arch: amd64_arm64
 
       - name: Build release binary
         run: cargo build --locked --release --target ${{ matrix.target }}
@@ -116,7 +111,7 @@ jobs:
           tar -C "$package_dir" -czf "$archive_path" .
 
       - name: Upload release asset
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: release-${{ matrix.target }}
           path: bing-auto-reward-${{ github.ref_name }}-${{ matrix.asset_suffix }}.${{ matrix.extension }}
@@ -133,7 +128,7 @@ jobs:
 
     steps:
       - name: Download release assets
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           path: release-assets
           merge-multiple: true
@@ -147,7 +142,7 @@ jobs:
           popd
 
       - name: Publish release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           files: release-assets/*
           fail_on_unmatched_files: true
