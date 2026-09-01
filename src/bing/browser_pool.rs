@@ -1,5 +1,9 @@
 use std::{
+    cell::{Cell, RefCell},
+    collections::VecDeque,
+    future::poll_fn,
     ops::{Deref, DerefMut},
+    task::{Poll, Waker},
     time::Duration,
 };
 
@@ -65,8 +69,9 @@ impl Drop for BingBot {
         let temp_dir = self.temp_dir.take();
         self.page.take();
 
-        // 在 Drop 中无法 await，尽量异步关闭浏览器并释放资源，避免阻塞 tokio worker。
-        let _handle = tokio::spawn(async move {
+        // Drop 里不能 await。spawn_local 的清理任务会在当前 local runtime
+        // 下次让出时执行，不要在这里做阻塞等待。
+        let _handle = tokio::task::spawn_local(async move {
             if let (Some(browser), Some(task)) = (browser, task) {
                 shutdown_browser(browser, task).await;
             }
@@ -76,12 +81,58 @@ impl Drop for BingBot {
     }
 }
 
+/// 单线程任务间的许可计数；不需要跨线程同步。
+struct LocalSemaphore {
+    remaining: Cell<usize>,
+    waiters: RefCell<VecDeque<Waker>>,
+}
+
+struct LocalPermit<'a> {
+    sem: &'a LocalSemaphore,
+}
+
+impl Drop for LocalPermit<'_> {
+    fn drop(&mut self) {
+        self.sem.release();
+    }
+}
+
+impl LocalSemaphore {
+    fn new(permits: usize) -> Self {
+        Self {
+            remaining: Cell::new(permits),
+            waiters: RefCell::new(VecDeque::new()),
+        }
+    }
+
+    async fn acquire(&self) -> LocalPermit<'_> {
+        poll_fn(|cx| {
+            let remaining = self.remaining.get();
+            if remaining > 0 {
+                self.remaining.set(remaining - 1);
+                Poll::Ready(LocalPermit { sem: self })
+            } else {
+                self.waiters.borrow_mut().push_back(cx.waker().clone());
+                Poll::Pending
+            }
+        })
+        .await
+    }
+
+    fn release(&self) {
+        self.remaining.set(self.remaining.get() + 1);
+        if let Some(waker) = self.waiters.borrow_mut().pop_front() {
+            waker.wake();
+        }
+    }
+}
+
 pub(crate) struct BrowserPool {
-    semaphore: tokio::sync::Semaphore,
+    semaphore: LocalSemaphore,
 }
 
 pub(crate) struct PoolWrapper<'a> {
-    _permit: tokio::sync::SemaphorePermit<'a>,
+    _permit: LocalPermit<'a>,
     bot: BingBot,
 }
 
@@ -101,18 +152,13 @@ impl<'a> DerefMut for PoolWrapper<'a> {
 impl BrowserPool {
     pub(crate) fn new(cnt: usize) -> Self {
         Self {
-            semaphore: tokio::sync::Semaphore::new(cnt),
+            semaphore: LocalSemaphore::new(cnt),
         }
     }
 
-    pub(crate) async fn get_bot<'a>(&'a self) -> PoolWrapper<'a> {
-        let permit = self
-            .semaphore
-            .acquire()
-            .await
-            .expect("浏览器池信号量已关闭");
+    pub(crate) async fn get_bot(&self) -> PoolWrapper<'_> {
         PoolWrapper {
-            _permit: permit,
+            _permit: self.semaphore.acquire().await,
             bot: BingBot::default(),
         }
     }

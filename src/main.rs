@@ -8,7 +8,7 @@ mod hot_searches;
 mod random;
 mod user_agent;
 
-#[tokio::main(worker_threads = 1)]
+#[tokio::main(flavor = "local")]
 async fn main() -> anyhow::Result<()> {
     let _guard = init_tracing();
     process("config.json")

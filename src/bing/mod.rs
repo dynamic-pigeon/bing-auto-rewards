@@ -1,8 +1,9 @@
 use std::{
+    cell::Cell,
     fs,
     path::Path,
+    rc::Rc,
     str::FromStr,
-    sync::Arc,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
@@ -11,7 +12,7 @@ use chromiumoxide::browser::{Browser, BrowserConfig};
 use chromiumoxide::page::{Page, ScreenshotParams};
 use chromiumoxide_cdp::cdp::browser_protocol::page::CaptureScreenshotFormat;
 use chrono::Local;
-use tokio::sync::watch;
+use tokio::sync::Notify;
 use tokio::task::JoinSet;
 use tracing::{Instrument, debug, error, info, warn};
 
@@ -106,14 +107,43 @@ fn already_running_error(path: &Path) -> anyhow::Error {
     }
 }
 
-fn spawn_shutdown_listener() -> watch::Receiver<bool> {
-    let (tx, rx) = watch::channel(false);
-    tokio::spawn(async move {
-        wait_for_shutdown_signal().await;
-        info!("收到退出信号，开始优雅退出");
-        let _ = tx.send(true);
-    });
-    rx
+#[derive(Clone)]
+struct Shutdown {
+    flag: Rc<Cell<bool>>,
+    notify: Rc<Notify>,
+}
+
+impl Shutdown {
+    fn new() -> Self {
+        Self {
+            flag: Rc::new(Cell::new(false)),
+            notify: Rc::new(Notify::new()),
+        }
+    }
+
+    fn spawn_listener(&self) {
+        let this = self.clone();
+        tokio::task::spawn_local(async move {
+            wait_for_shutdown_signal().await;
+            info!("收到退出信号，开始优雅退出");
+            this.flag.set(true);
+            this.notify.notify_waiters();
+        });
+    }
+
+    fn is_signaled(&self) -> bool {
+        self.flag.get()
+    }
+
+    async fn wait(&self) {
+        loop {
+            let notified = self.notify.notified();
+            if self.flag.get() {
+                return;
+            }
+            notified.await;
+        }
+    }
 }
 
 async fn wait_for_shutdown_signal() {
@@ -146,37 +176,32 @@ async fn wait_for_shutdown_signal() {
     }
 }
 
-async fn wait_for_shutdown(rx: &mut watch::Receiver<bool>) {
-    let _ = rx.wait_for(|signaled| *signaled).await;
-}
-
 pub(crate) async fn process<P: AsRef<Path>>(config_file: P) -> Result<()> {
     let _instance_lock = acquire_instance_lock_at(Path::new(INSTANCE_LOCK_PATH))?;
     let config_file = std::fs::File::open(config_file)?;
 
-    let config: Arc<Config> = Arc::new(serde_json::from_reader(config_file)?);
+    let config: Rc<Config> = Rc::new(serde_json::from_reader(config_file)?);
 
     if let Some(user_agent) = config.user_agent.as_deref() {
         crate::user_agent::set_user_agent(user_agent);
     }
 
-    let pool = Arc::new(BrowserPool::new(config.max_threads));
-    let shutdown_rx = spawn_shutdown_listener();
+    let pool = Rc::new(BrowserPool::new(config.max_threads));
+    let shutdown = Shutdown::new();
+    shutdown.spawn_listener();
 
     if let Some(schedule) = config.schedule.as_deref() {
         let schedule = croner::Cron::from_str(schedule)
             .inspect_err(|e| error!("定时任务格式串解析有误：{}", e))?;
 
         info!("第一次执行无视定时任务");
-        if let Err(e) =
-            process_once(Arc::clone(&config), Arc::clone(&pool), shutdown_rx.clone()).await
-        {
+        if let Err(e) = process_once(Rc::clone(&config), Rc::clone(&pool), shutdown.clone()).await {
             error!("定时任务执行失败：{}", e);
         }
 
         // 每次跑完再取“现在之后”的下一次，避免任务耗时超过间隔时立刻补跑过期档期。
         loop {
-            if *shutdown_rx.borrow() {
+            if shutdown.is_signaled() {
                 info!("收到退出信号，停止调度");
                 break;
             }
@@ -196,35 +221,30 @@ pub(crate) async fn process<P: AsRef<Path>>(config_file: P) -> Result<()> {
                 duration.as_secs()
             );
 
-            let mut wait_rx = shutdown_rx.clone();
             tokio::select! {
                 _ = tokio::time::sleep(duration) => {}
-                _ = wait_for_shutdown(&mut wait_rx) => {
+                _ = shutdown.wait() => {
                     info!("收到退出信号，停止调度");
                     break;
                 }
             }
-            if *shutdown_rx.borrow() {
+            if shutdown.is_signaled() {
                 break;
             }
             if let Err(e) =
-                process_once(Arc::clone(&config), Arc::clone(&pool), shutdown_rx.clone()).await
+                process_once(Rc::clone(&config), Rc::clone(&pool), shutdown.clone()).await
             {
                 error!("定时任务执行失败：{}", e);
             }
         }
     } else {
-        process_once(config, pool, shutdown_rx).await?;
+        process_once(config, pool, shutdown).await?;
     }
 
     Ok(())
 }
 
-async fn process_once(
-    config: Arc<Config>,
-    pool: Arc<BrowserPool>,
-    mut shutdown: watch::Receiver<bool>,
-) -> Result<()> {
+async fn process_once(config: Rc<Config>, pool: Rc<BrowserPool>, shutdown: Shutdown) -> Result<()> {
     if config.store_local
         && let Some(days) = config.user_data_cleanup_days
     {
@@ -236,7 +256,7 @@ async fn process_once(
 
     tokio::select! {
         biased;
-        _ = wait_for_shutdown(&mut shutdown) => {
+        _ = shutdown.wait() => {
             info!("收到退出信号，取消本轮任务");
             return Ok(());
         }
@@ -248,14 +268,15 @@ async fn process_once(
     let mut join_set = JoinSet::new();
     for account in &config.accounts {
         let account = account.clone();
-        let config = Arc::clone(&config);
-        let pool = Arc::clone(&pool);
+        let config = Rc::clone(&config);
+        let pool = Rc::clone(&pool);
         let task_shutdown = shutdown.clone();
         let account_email = account.email.clone();
         let account_span = tracing::info_span!("account", email = %account_email);
-        join_set.spawn(
+        join_set.spawn_local(
             async move {
-                let result = process_account(account, config.as_ref(), pool, task_shutdown).await;
+                let result =
+                    process_account(account, config.as_ref(), pool.as_ref(), task_shutdown).await;
                 (account_email, result)
             }
             .instrument(account_span),
@@ -273,7 +294,7 @@ async fn process_once(
             Err(e) => {
                 errors += 1;
                 error!(
-                    "处理账号的线程发生错误：{}",
+                    "处理账号的任务发生错误：{}",
                     if e.is_panic() {
                         "账号处理任务 panic"
                     } else {
@@ -285,7 +306,7 @@ async fn process_once(
     }
 
     if errors > 0 {
-        anyhow::bail!("{} 个账号处理线程出现异常", errors);
+        anyhow::bail!("{} 个账号处理任务出现异常", errors);
     }
 
     Ok(())
@@ -356,12 +377,12 @@ async fn account_dir_last_used(path: &Path) -> Option<SystemTime> {
 async fn process_account(
     account: Account,
     config: &Config,
-    pool: Arc<BrowserPool>,
-    mut shutdown: watch::Receiver<bool>,
+    pool: &BrowserPool,
+    shutdown: Shutdown,
 ) -> Result<()> {
     tokio::select! {
         biased;
-        _ = wait_for_shutdown(&mut shutdown) => Ok(()),
+        _ = shutdown.wait() => Ok(()),
         result = process_account_with_retry(account, config, pool) => result,
     }
 }
@@ -373,7 +394,7 @@ async fn process_account_with_retry(
         ref browser_path,
         ..
     }: &Config,
-    pool: Arc<BrowserPool>,
+    pool: &BrowserPool,
 ) -> Result<()> {
     let mut last_err: Option<anyhow::Error> = None;
     for i in 0..2 {
@@ -555,7 +576,7 @@ mod tests {
         fs::write(dir.join(LAST_USED_MARKER), ts.to_string()).unwrap();
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "local")]
     async fn cleanup_deletes_stale_account_dirs_only() {
         let root = tempfile::TempDir::new().unwrap();
         let stale = root.path().join("pc_stale@example.com");

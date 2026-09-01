@@ -65,7 +65,7 @@ impl BingBot {
             .await
             .map_err(|e| anyhow!("启动浏览器失败：{}", e))?;
 
-        let handler_task = tokio::spawn(async move {
+        let handler_task = tokio::task::spawn_local(async move {
             while let Some(h) = handler.next().await {
                 if h.is_err() {
                     break;
@@ -74,7 +74,7 @@ impl BingBot {
         });
 
         let page = get_one_page(&browser).await?;
-        page.enable_stealth_mode_with_agent(user_agent())
+        page.enable_stealth_mode_with_agent(&user_agent())
             .await
             .map_err(|e| anyhow!("启用反检测模式失败：{}", e))?;
 
