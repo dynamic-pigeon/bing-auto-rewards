@@ -99,6 +99,8 @@ RUST_LOG=debug,chromiumoxide=error ./bing-auto-reward
 - 定时任务模式下，程序会按 Cron 表达式顺序执行；若某次执行耗时较长，后续执行会顺延等待。
 - 若登录或搜索过程中出现异常，程序会自动截图保存到 `failed/` 目录以便排查。
 - 如果登录频繁失败（例如卡在登录页、提示异常或被风控拦截），可以尝试在 `config.json` 中通过 `user_agent` 换成其他 UA（建议使用与本地浏览器版本一致的 Chrome UA），往往能绕过部分检测。
+- 浏览器默认以沙箱模式启动；在禁用 unprivileged userns 的内核或容器中沙箱无法初始化时，程序会记录一条警告并自动改用 `--no-sandbox` 重试。
+- 残留浏览器锁的自动恢复（清理 `SingletonLock` 并结束残留 Chrome 进程）目前仅支持 Linux/macOS；Windows 下如遇到用户数据目录被占用的报错，请手动结束 Chrome 进程或删除对应的 `user-data` 目录。
 
 ## 开发
 

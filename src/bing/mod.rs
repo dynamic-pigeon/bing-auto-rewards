@@ -397,7 +397,8 @@ async fn process_account_with_retry(
     pool: &BrowserPool,
 ) -> Result<()> {
     let mut last_err: Option<anyhow::Error> = None;
-    for i in 0..2 {
+    const ACCOUNT_RETRY_TIMES: usize = 2;
+    for i in 0..ACCOUNT_RETRY_TIMES {
         let mut bot = pool.get_bot().await;
         match async {
             bot.new_pc_browser(store_local, &account.email, browser_path, &account.proxy)
@@ -416,20 +417,25 @@ async fn process_account_with_retry(
                 debug!("账号 {} 第 {} 次处理失败: {}", account.email, i + 1, e);
                 last_err = Some(e);
                 bot.close_browser().await;
-                tokio::time::sleep(Duration::from_secs(2)).await;
+                if i + 1 < ACCOUNT_RETRY_TIMES {
+                    tokio::time::sleep(Duration::from_secs(2)).await;
+                }
             }
         }
     }
-    if let Some(e) = last_err {
-        return Err(anyhow!("处理账号 {} 失败: {}", account.email, e));
+    // 循环至少执行一次且每条失败路径都会记录 last_err；账号信息由调用方的
+    // 日志字段补充，不再重复拼进错误消息。
+    match last_err {
+        Some(e) => Err(e.context("处理账号失败")),
+        None => unreachable!("重试循环至少执行一次"),
     }
-    Err(anyhow!("处理账号 {} 失败，未记录具体原因", account.email))
 }
 
 fn default_browser_config(
     browser_path: &Option<String>,
     user_dir: Option<std::path::PathBuf>,
     proxy: &Option<String>,
+    force_no_sandbox: bool,
 ) -> Result<BrowserConfig> {
     let mut config = BrowserConfig::builder();
     if !HEADLESS {
@@ -438,7 +444,12 @@ fn default_browser_config(
     config = config
         .launch_timeout(Duration::from_secs(60))
         .request_timeout(Duration::from_secs(60));
-    config = config.no_sandbox();
+    // 浏览器持有已登录的账号会话并会点开任意的搜索结果页，
+    // 沙箱默认保持开启；仅在以 root 运行（Chrome 拒绝带沙箱启动）或
+    // 调用方明确回退时才关闭。
+    if force_no_sandbox || is_running_as_root() {
+        config = config.no_sandbox();
+    }
     config = config.window_size(1920, 1080);
     if let Some(path) = browser_path {
         config = config.chrome_executable(std::path::PathBuf::from(path));
@@ -456,10 +467,8 @@ fn default_browser_config(
         "disable-dev-shm-usage",
         "disable-extensions",
         "disable-blink-features=AutomationControlled",
-        "allow-running-insecure-content",
         "disable-plugins",
         "disable-images",
-        "disable-web-security",
         "mute-audio",
         "no-first-run",
         "no-default-browser-check",
@@ -471,6 +480,16 @@ fn default_browser_config(
     config
         .build()
         .map_err(|e| anyhow!("构建浏览器启动选项失败：{}", e))
+}
+
+#[cfg(unix)]
+fn is_running_as_root() -> bool {
+    (unsafe { libc::geteuid() }) == 0
+}
+
+#[cfg(not(unix))]
+fn is_running_as_root() -> bool {
+    false
 }
 
 fn resolve_user_data_dir(dir: std::path::PathBuf) -> Result<std::path::PathBuf> {

@@ -2,6 +2,8 @@
 ///
 /// 使用线性提升概率模型：第 k 次尝试命中概率为 `min(1, k * base_p)`。
 /// 通过对 `base_p` 进行二分搜索校准，使得理论期望触发间隔 ≈ n。
+use rand::{Rng, RngExt};
+
 pub struct ExpectedNTrigger {
     /// 校准后的线性增长基础概率（不直接等于 1/n）
     base_p: f64,
@@ -27,11 +29,10 @@ impl ExpectedNTrigger {
 
     /// 二分搜索找到合适的 base_p，使得线性增长概率模型的期望触发间隔接近 target_n
     fn calibrate_base_p(target_n: f64) -> f64 {
-        // base_p 不能过大（否则很快到 1），也不能过小（否则期望过长）
+        // E[间隔] 随 base_p 单调递减，且 base_p = 1/n 时期望约为 O(√n)，
+        // 必然小于 n，因此真实解落在 (0, 1/n) 内，上界取 1/n 即可
         let mut low = 0.0_f64;
-        let mut high = 1.0 / target_n; // 直接用 1/n 作为上界，会比需要的值偏大
-        // 为防止极端情况，将上界再放宽一些
-        high = high.max(1.0 / (target_n * 0.5));
+        let mut high = 1.0 / target_n;
 
         let mut best = high;
         for _ in 0..50 {
@@ -73,12 +74,13 @@ impl ExpectedNTrigger {
         expectation
     }
 
-    /// 调用一次，返回是否触发
-    pub fn next(&mut self) -> bool {
+    /// 调用一次，返回是否触发。
+    ///
+    /// 随机源由调用方注入，便于测试时使用可播种的 RNG。
+    pub fn next(&mut self, rng: &mut impl Rng) -> bool {
         let attempt_number = self.attempts + 1;
         let chance = (attempt_number as f64 * self.base_p).min(1.0);
-        let r = rand::random::<f64>();
-        let hit = r < chance;
+        let hit = rng.random::<f64>() < chance;
         if hit {
             self.reset();
         } else {
@@ -95,9 +97,32 @@ impl ExpectedNTrigger {
 
 #[cfg(test)]
 mod test {
+    use rand::{SeedableRng, rngs::StdRng};
+
     #[test]
     fn expected_n_trigger_eventually_hits() {
+        let mut rng = rand::rng();
         let mut trigger = super::ExpectedNTrigger::new(4);
-        assert!((0..32).any(|_| trigger.next()));
+        assert!((0..32).any(|_| trigger.next(&mut rng)));
+    }
+
+    /// 校准后的平均触发间隔应收敛到目标 n 附近（固定种子，结果可复现）
+    #[test]
+    fn calibrated_trigger_averages_target_interval() {
+        let mut rng = StdRng::seed_from_u64(42);
+        let mut trigger = super::ExpectedNTrigger::new(4);
+        let mut hits = 0usize;
+        let mut attempts = 0usize;
+        while hits < 20_000 {
+            attempts += 1;
+            if trigger.next(&mut rng) {
+                hits += 1;
+            }
+        }
+        let mean = attempts as f64 / hits as f64;
+        assert!(
+            (3.5..=4.5).contains(&mean),
+            "平均触发间隔 {mean} 偏离目标 4"
+        );
     }
 }

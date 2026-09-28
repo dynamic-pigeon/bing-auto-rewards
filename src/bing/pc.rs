@@ -59,11 +59,21 @@ impl BingBot {
             ensure_profile_unlocked(dir).await?;
         }
 
-        let config = default_browser_config(browser_path, user_dir, proxy)?;
+        let config = default_browser_config(browser_path, user_dir.clone(), proxy, false)?;
 
-        let (browser, mut handler) = Browser::launch(config)
-            .await
-            .map_err(|e| anyhow!("启动浏览器失败：{}", e))?;
+        let (browser, mut handler) = match Browser::launch(config).await {
+            Ok(launched) => launched,
+            Err(e) if !super::is_running_as_root() => {
+                // 沙箱在禁用 unprivileged userns 的内核/容器上无法初始化，
+                // 此时退回 --no-sandbox 再试一次；root 场景首轮就已关沙箱。
+                warn!("启动浏览器失败，尝试关闭沙箱重试：{}", e);
+                let fallback = default_browser_config(browser_path, user_dir, proxy, true)?;
+                Browser::launch(fallback)
+                    .await
+                    .map_err(|e| anyhow!("启动浏览器失败：{}", e))?
+            }
+            Err(e) => return Err(anyhow!("启动浏览器失败：{}", e)),
+        };
 
         let handler_task = tokio::task::spawn_local(async move {
             while let Some(h) = handler.next().await {
@@ -187,31 +197,36 @@ fn read_chrome_singleton_lock(user_data_dir: &Path) -> Option<(String, u32)> {
 
 #[cfg(unix)]
 fn current_hostname() -> Option<String> {
-    let output = std::process::Command::new("hostname").output().ok()?;
-    if !output.status.success() {
+    // Chrome 写入 SingletonLock 的主机名来自 gethostname(2)，用同一系统调用
+    // 比对，也避免 shell 外呼阻塞单线程 runtime
+    let mut buf = [0u8; 256];
+    let ret = unsafe { libc::gethostname(buf.as_mut_ptr().cast(), buf.len()) };
+    if ret != 0 {
         return None;
     }
-    let host = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    if host.is_empty() { None } else { Some(host) }
+    let end = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
+    let host = String::from_utf8_lossy(&buf[..end]).trim().to_string();
+    (!host.is_empty()).then_some(host)
 }
 
 #[cfg(unix)]
 fn is_pid_alive(pid: u32) -> bool {
-    std::process::Command::new("ps")
-        .args(["-p", &pid.to_string()])
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
+    // kill(pid, 0) 只做存在性检查，不投递信号；EPERM 表示进程存在但
+    // 属于其他用户
+    if unsafe { libc::kill(pid as libc::pid_t, 0) } == 0 {
+        return true;
+    }
+    std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
 }
 
 #[cfg(unix)]
 fn terminate_pid(pid: u32, force: bool) {
-    let signal = if force { "-KILL" } else { "-TERM" };
-    let _ = std::process::Command::new("kill")
-        .args([signal, &pid.to_string()])
-        .status();
+    let signal = if force { libc::SIGKILL } else { libc::SIGTERM };
+    // pid 来自 SingletonLock 且已校验本机 hostname，非本程序启动的 Chrome
+    // 一般不会命中；kill 失败时由调用方的存活轮询兜底
+    unsafe {
+        libc::kill(pid as libc::pid_t, signal);
+    }
 }
 
 #[cfg(unix)]
@@ -305,7 +320,7 @@ async fn search(browser_bot: &mut BingBot, email: &str) -> Result<()> {
     let mut trigger = ExpectedNTrigger::new(GAP_NUM);
     for (i, word) in search_words.into_iter().enumerate() {
         let page = browser_bot.get_page()?;
-        let sleep_time = if trigger.next() {
+        let sleep_time = if trigger.next(&mut rand::rng()) {
             match get_pc_search_process(page).await {
                 Ok((cur_points, max_points)) => {
                     info!(
@@ -337,18 +352,21 @@ async fn search(browser_bot: &mut BingBot, email: &str) -> Result<()> {
         if sleep_time < MAX_SLEEP_TIME {
             tokio::time::sleep(Duration::from_secs(sleep_time)).await;
         } else {
+            // 长等待分片进行，每 30 秒主动产生一次页面命令（reload）保活，
+            // 避免长时间无协议流量导致连接被判空闲超时（沿用 headless_chrome
+            // 版本时代验证过的行为）
             let mut slept = 0;
             while slept < sleep_time {
                 let sleep_chunk = std::cmp::min(MAX_SLEEP_TIME, sleep_time - slept);
                 tokio::time::sleep(Duration::from_secs(sleep_chunk)).await;
-                // 空转防止 timeout
                 let _ = page.reload().await;
                 slept += sleep_chunk;
             }
         }
 
+        const SEARCH_RETRY_TIMES: usize = 3;
         let mut search_last_err: Option<anyhow::Error> = None;
-        for _j in 0..3 {
+        for i in 0..SEARCH_RETRY_TIMES {
             let page = browser_bot.get_page()?;
             let browser = browser_bot.get_browser()?;
             match perform_search_and_click(browser, page, &word).await {
@@ -359,7 +377,14 @@ async fn search(browser_bot: &mut BingBot, email: &str) -> Result<()> {
                 Err(e) => {
                     warn!("搜索点击失败，尝试重启浏览器: {}", e);
                     search_last_err = Some(e);
-                    browser_bot.restart_pc_browser().await?;
+                    if i + 1 == SEARCH_RETRY_TIMES {
+                        break;
+                    }
+                    // 重启失败时保留原始搜索错误返回，避免掩盖真实原因
+                    if let Err(restart_err) = browser_bot.restart_pc_browser().await {
+                        warn!("重启浏览器失败，保留原始搜索错误: {}", restart_err);
+                        break;
+                    }
                     tokio::time::sleep(RETRY_DELAY).await;
                 }
             }
@@ -458,58 +483,61 @@ async fn reload_hard(page: &Page) -> Result<()> {
     Ok(())
 }
 
-/// 轮询等待页面中匹配 CSS 选择器的单个元素出现。
+const POLL_INTERVAL: Duration = Duration::from_millis(200);
+
+/// 轮询执行查询直到返回 `Some` 或超时。
 ///
-/// `chromiumoxide` 的 `find_element` 只执行一次查询；原 `headless_chrome` 的
-/// `wait_for_element` 会轮询 DOM 直到超时。本函数恢复原有语义。
+/// `chromiumoxide` 的 `find_element(s)`/`find_xpath` 只执行一次查询；原
+/// `headless_chrome` 的 `wait_for_element` 会轮询 DOM 直到超时。本函数恢复
+/// 原有语义，供下面三个包装函数共用。
+async fn poll_until<T>(
+    timeout_msg: String,
+    timeout: Duration,
+    mut query: impl AsyncFnMut() -> Option<T>,
+) -> Result<T> {
+    let start = std::time::Instant::now();
+    loop {
+        if let Some(value) = query().await {
+            return Ok(value);
+        }
+        if start.elapsed() >= timeout {
+            anyhow::bail!("{timeout_msg}");
+        }
+        tokio::time::sleep(POLL_INTERVAL).await;
+    }
+}
+
 async fn wait_for_element(page: &Page, selector: &str, timeout: Duration) -> Result<Element> {
-    let start = std::time::Instant::now();
-    loop {
-        match page.find_element(selector).await {
-            Ok(ele) => return Ok(ele),
-            _ => {
-                if start.elapsed() >= timeout {
-                    anyhow::bail!("等待选择器 {} 的元素超时", selector);
-                }
-                tokio::time::sleep(Duration::from_millis(200)).await;
-            }
-        }
-    }
+    poll_until(
+        format!("等待选择器 {selector} 的元素超时"),
+        timeout,
+        async || page.find_element(selector).await.ok(),
+    )
+    .await
 }
 
-/// 轮询等待页面中匹配 XPath 的单个元素出现。
 async fn wait_for_xpath(page: &Page, xpath: &str, timeout: Duration) -> Result<Element> {
-    let start = std::time::Instant::now();
-    loop {
-        match page.find_xpath(xpath).await {
-            Ok(ele) => return Ok(ele),
-            _ => {
-                if start.elapsed() >= timeout {
-                    anyhow::bail!("等待 XPath {} 的元素超时", xpath);
-                }
-                tokio::time::sleep(Duration::from_millis(200)).await;
-            }
-        }
-    }
+    poll_until(
+        format!("等待 XPath {xpath} 超时"),
+        timeout,
+        async || page.find_xpath(xpath).await.ok(),
+    )
+    .await
 }
 
-/// 轮询等待页面中匹配选择器的元素出现（至少一个）。
+/// 等待页面中匹配选择器的元素出现（至少一个）。
 ///
 /// 页面动态渲染时，容器可能在 DOMContentLoaded 后就存在，但子元素会延迟填充。
-/// chromiumoxide 的 `find_elements` 只执行一次查询，不会主动等待，因此需要手动轮询。
 async fn wait_for_elements(page: &Page, selector: &str, timeout: Duration) -> Result<Vec<Element>> {
-    let start = std::time::Instant::now();
-    loop {
-        match page.find_elements(selector).await {
-            Ok(elements) if !elements.is_empty() => return Ok(elements),
-            _ => {
-                if start.elapsed() >= timeout {
-                    anyhow::bail!("等待选择器 {} 的元素超时", selector);
-                }
-                tokio::time::sleep(Duration::from_millis(200)).await;
-            }
-        }
-    }
+    poll_until(
+        format!("等待选择器 {selector} 的元素超时"),
+        timeout,
+        async || {
+            let elements = page.find_elements(selector).await.ok()?;
+            (!elements.is_empty()).then_some(elements)
+        },
+    )
+    .await
 }
 
 async fn click_earn(browser: &Browser, page: &Page, email: &str, password: &str) -> Result<()> {
